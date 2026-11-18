@@ -1,0 +1,18 @@
+{
+  "name": "session-sync",
+  "version": "0.1.0",
+  "description": "通用 n:n coding agent 会话同步 skill：把任意 agent 的会话导入任意 agent（幂等/差异追加/分叉/round-trip 收敛），零依赖 Node.js 实现",
+  "type": "module",
+  "engines": {
+    "node": ">=22.22"
+  },
+  "bin": {
+    "session-sync": "bin/session-sync.mjs"
+  },
+  "scripts": {
+    "selftest": "node bin/session-sync.mjs selftest",
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "license": "MIT",
+  "private": true
+}

@@ -1,0 +1,14 @@
+node_modules/
+.opencode-src/
+.zcode-src/
+.zcode-tmp/
+.cline-src/
+.kilo-src/
+*.bak-*
+.DS_Store
+*.log
+.tmp-diag/
+
+# 本机安装产物与个人工作日志（不入库：含绝对路径与日记内容）
+.agents/
+.workbuddy/
