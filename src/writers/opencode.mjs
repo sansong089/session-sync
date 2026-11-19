@@ -1,7 +1,7 @@
 // writers/opencode.mjs — 写 OpenCode 新 schema（session_v2 + session_message 内联 content）
 //
 // session_v2.metadata 是 provenance 的自然槽位
-// session_message.type：user / assistant（其余如 system/compaction 为机械事件）
+// session_message.type：user / assistant / compaction（宿主注入的压缩摘要；其余如 system 为机械事件）
 // assistant.data.content[]：reasoning / text / tool{id,name,state{status,input,content}}
 // project_id 必须指向真实 project 行（复刻 opencode Project.resolve），
 // 否则 `opencode session list` / TUI 的 /sessions 按当前项目过滤后看不到导入的会话。
@@ -19,6 +19,7 @@ import { tableExists, tableColumns, firstExisting, safeJson, TOOL_RESULT_ONLY, T
 import { isNativeOpencodeId, importedNativeId } from '../opencode-id.mjs';
 import { classifySource, resolvePlacement } from '../placement.mjs';
 import { isFile } from '../util.mjs';
+import { compactionInjectionKind, compactionSummaryText } from '../text.mjs';
 import { roleRoots } from '../roots.mjs';
 import { makeTitleSyncer } from './title-slots.mjs';
 
@@ -94,7 +95,30 @@ function turnToEvents(turn, session, modelRef) {
   const userTexts = userItems.filter((it) => it.kind === 'message').map((it) => it.text);
   const userFiles = userItems.filter((it) => it.kind === 'attachment' && it.ref).map((it) => ({ url: String(it.ref), type: 'file' }));
   const firstUserTs = Number((turn.items ?? []).find((it) => it.ts)?.ts) || session.updatedAt || session.createdAt;
-  if (userTexts.length || userFiles.length) {
+  // 宿主注入的压缩摘要落成**原生 compaction 行**：宿主把最新一条 completed 摘要当历史边界，
+  // 只读它之后的消息（上游 history.ts latestCompaction / messageEntries），上下文估算随之变小。
+  // 写成普通 user 消息的话，超大导入会话续写时会被整体压平成一条超模型上下文的请求（400003）。
+  // 摘要正文一个字不丢，只是不再冒充用户提问。
+  const stripped = userTexts.map(compactionSummaryText);
+  const summaryText = compactionSummaryText(userTexts.join('\n\n'));
+  const allCompaction =
+    stripped.some((s, i) => s !== userTexts[i]) &&
+    userTexts.every((t, i) => stripped[i] !== t || compactionInjectionKind(t));
+  // 混排真实用户文本 / 带附件 / 剥壳后为空 → 仍走普通 user 行：空摘要会被读侧跳过，写出去就丢一轮
+  if (allCompaction && !userFiles.length && summaryText.trim()) {
+    events.push({
+      type: 'compaction',
+      ts: firstUserTs,
+      // 判别器来自行的 type 列（上游 rowInput 注入），data 内不放 type；键集是原生 compaction 行的子集
+      data: {
+        time: { created: firstUserTs },
+        status: 'completed',
+        reason: 'auto',
+        summary: summaryText,
+        ...(modelRef ? { model: modelRef } : {}),
+      },
+    });
+  } else if (userTexts.length || userFiles.length) {
     events.push({ type: 'user', ts: firstUserTs, data: { time: { created: firstUserTs }, text: userTexts.join('\n\n'), files: userFiles, agents: [] } });
   }
 

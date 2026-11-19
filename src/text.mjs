@@ -81,3 +81,21 @@ export function compactionInjectionKind(text) {
   }
   return null;
 }
+
+// 剥掉摘要的宿主包裹，只留内层正文 X。整段包裹只是特例：摘要与真实用户文本混排、
+// 一段文本里嵌多份摘要、甚至嵌套包裹都要剥干净 —— 核心指纹若只在「整段纯摘要」时剥，
+// 混排形态两侧就会算出不同骨架，复跑被判成分叉。无标签原样返回（对普通文本是恒等变换）。
+// 用 indexOf 循环而非正则：标签无需转义，每轮严格缩短必然终止，缺闭合标签时不吞正文。
+export function compactionSummaryText(text) {
+  let t = String(text ?? '');
+  for (const [open, close] of COMPACTION_TAGS) {
+    for (;;) {
+      const i = t.indexOf(open);
+      if (i === -1) break;
+      const j = t.indexOf(close, i + open.length);
+      if (j === -1) break;
+      t = t.slice(0, i) + t.slice(i + open.length, j) + t.slice(j + close.length);
+    }
+  }
+  return t;
+}

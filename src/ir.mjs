@@ -6,6 +6,7 @@
 // - 指纹只认"内容"，不认时间戳/model/id：规范化后 sha256
 import { sha256hex, stableStringify } from './util.mjs';
 import { previewTitle } from './titles.mjs';
+import { compactionSummaryText } from './text.mjs';
 
 export const ItemKind = {
   Message: 'message',
@@ -129,7 +130,9 @@ export function canonicalInput(input) {
 export function coreItem(item) {
   switch (item?.kind) {
     case ItemKind.Message: {
-      const t = normalizeText(item.text);
+      // 压缩摘要在各宿主是 <cb_summary> / <conversation_history_summary> / 原生 compaction 三种表示，
+      // 剥到内层正文才是同一个骨架；无条件剥（不先判整段是否纯摘要），混排形态两侧才一致。
+      const t = normalizeText(compactionSummaryText(item.text));
       // 装得下附件的宿主存成附件，装不下的（claude/codex/dsh/freebuff/workbuddy 五家写入侧）
       // 存成 `[attachment] <路径>` 这一行占位文本。同一会话在两侧会算出不同的消息项，
       // 所以这种纯占位行不进核心；正文里普通提到该串的不受影响（要求整行仅此占位）。

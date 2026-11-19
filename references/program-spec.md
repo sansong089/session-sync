@@ -309,6 +309,17 @@ WorkBuddy 的 `transport`/`unread`/`thought_level` 就不在 baseline 里 ——
   循环往返才不会被判成分叉。摘要**一个字都不丢**，只标 `msg_type=3`（SystemEvent），
   不冒充用户提问。注意：宿主前端的 user 消息分支看的是 `role` 与内容标签，**不看 `msg_type`**，
   所以当前版本仍会把摘要显示成用户气泡 —— 这是展示层的事，丢内容才是数据事故。
+  核心指纹先剥掉包裹标签再哈希（`src/text.mjs` 的 `compactionSummaryText`，在 `src/ir.mjs` 的
+  `coreItem` 里**无条件**施加）：同一份摘要的三种宿主表示剥到内层正文才是同一个骨架，
+  混排（摘要 + 真实用户文本）两侧也才算出同一核心。
+- opencode 的压缩摘要落成宿主**原生压缩边界**：纯压缩轮写 `session_message` 的
+  `type='compaction'` / `status='completed'` 行，摘要正文进 `data.summary`
+  （`src/writers/opencode.mjs` 的 `turnToEvents`）。宿主把最新一条 completed 摘要当历史边界、
+  只读它之后的消息，上下文估算随之变小 —— 写成普通 user 消息的话，超大导入会话续写时
+  会被整体压平成一条超模型上下文的请求（网关判输入超长而拒绝）。读侧一条 compaction 行
+  还原成**一轮**（统一包成 `<cb_summary>`，`src/readers/opencode.mjs`），`list` 计数同判据。
+  混排真实用户文本 / 带附件 / 剥壳后为空 → 兜底普通 user 行（空摘要读侧会跳过，写出去就丢一轮）。
+  存量导入的摘要行不改写，要享受边界须删旧目标重导（见 `references/identity.md` 已知边界）。
 - mimo 孤儿 `tool_result`：源侧有回执但同轮找不到调用时，只落一个 `state.input=null` 的 tool 部件，
   读侧不得据此再补一个 `tool_call`（会让核心指纹多一项）。
 - qoder 三层写入：CLI 正文 jsonl + `main.sqlite` 的 `chat_sessions` 行 + `chat_session_messages` 投影；

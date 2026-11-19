@@ -142,7 +142,7 @@ originKey = "<origin.variant>:<origin.sessionId>"
 ### 4.4 轮次边界保真（写入侧不变量）
 
 核心指纹按**轮**比对，所以「同一会话在同一宿主里写下去再读回来，必须还是同一串轮次」是硬要求，
-否则源与目标的 LCP 提前截断，续写被误判成 `fork`。各家对「一轮」的表示并不一致，写侧因此统一四条：
+否则源与目标的 LCP 提前截断，续写被误判成 `fork`。各家对「一轮」的表示并不一致，写侧因此统一六条：
 
 | 规则 | 为什么 | 落点 |
 | --- | --- | --- |
@@ -151,6 +151,7 @@ originKey = "<origin.variant>:<origin.sessionId>"
 | 附件降级占位行 `[attachment] <路径>` 不进核心指纹 | 源侧是附件、目标侧是这行文本，进核心就永远对不上 | `src/ir.mjs` `coreItem` |
 | 部件时间戳写入时钳成不低于前一条 | 读侧按 `(time_created, id)` 排序，源里同轮部件时间戳并不单调，直写会重排工具顺序 | `src/writers/opencode-classic.mjs` |
 | 轮首附件先归位到本轮第一条 user 消息之后 | 把附件降级成 assistant 侧占位文本的宿主（12 家）会先发一条 assistant 消息，读侧 `assembleTurns` 因此凭空多开一轮、核心指纹整体平移一格 | `src/ir.mjs` `normalizeTurnItems` + `src/writers/index.mjs` `getWriter`（写侧唯一入口） |
+| 宿主注入的压缩摘要**剥掉包裹标签**后再进核心指纹 | 同一份摘要在各宿主是 `<cb_summary>` / `<conversation_history_summary>` / 原生 compaction 三种表示，不剥就永远对不上；剥壳**无条件**施加（不先判整段是否纯摘要），混排形态两侧才算出同一骨架 | `src/ir.mjs` `coreItem` + `src/text.mjs` `compactionSummaryText` |
 
 轮首附件是**写侧共用的输入假设**：12 家把附件降级成 assistant 侧内容、6 家把附件并进 user 侧，
 只有前者会在附件排在本轮用户消息之前时失真。因此归位放在 `getWriter()` 这一处，
@@ -162,8 +163,18 @@ originKey = "<origin.variant>:<origin.sessionId>"
 「开一轮」必须有可展示内容 —— WorkBuddy 原生用 `content: []` 的 user 事件标记「只有助手发言的一轮」
 （本机两家共 86 个），别的宿主读不出这种轮次，因此空标记一律并进上一轮，各家口径一致。
 
+压缩摘要在 opencode 落成宿主**原生 compaction 行**（`type='compaction'` / `status='completed'`，
+摘要正文进 `data.summary`）：宿主把最新一条 completed 摘要当历史边界、只读它之后的消息，
+上下文估算随之变小。写成普通 user 消息的话，超大导入会话续写时会被整体压平成一条超模型上下文的请求。
+读回时**一条 compaction 行 = 一轮** user 条目（统一包成 `<cb_summary>`），`list` 计数用同一判据，
+轮次边界与核心指纹都不位移。混排真实用户文本 / 带附件 / 剥壳后为空 → 仍走普通 user 行：
+空摘要会被读侧跳过，写出去就丢一轮。摘要正文一个字不丢，只是不再冒充用户提问。
+
 验证：`test/m37-turn-boundary.test.mjs`（三类形状逐一回读 + 轮首附件的 18 目标全矩阵 + 归位边界）
-+ `test/m7-matrix.test.mjs`（源里带多段用户文本，17 个目标逐个比对核心指纹）。
++ `test/m7-matrix.test.mjs`（源里带多段用户文本，17 个目标逐个比对核心指纹）
++ `test/m88-opencode-compaction.test.mjs`（剥壳单元 + 三种表示核心相等 + 混排收敛 + 写侧行形状
++ 读回/list 计数 + 幂等 + append 边界前移 + 三类兜底 + 存量后果 + 原生行与无效行 + repair 不改写
++ `--strict` 边界）。
 
 ---
 
@@ -191,3 +202,10 @@ originKey = "<origin.variant>:<origin.sessionId>"
 - **工具输出截断**：长输出可能被目标宿主截断，不影响身份判定。
 - **空会话**：`turns === 0` 且轮次为精确值时会跳过；采样得到的 0 不可信，不据此丢弃。
 - **标题**：`create` 保留原标题；`fork` 会加 `[origin变体]` 前缀便于区分。
+- **存量导入的压缩摘要**：规范化之前写入的摘要仍是普通 user 行，新核心指纹只让复跑判 `skip(identical)`
+  （**正文行不改写**，落点/标题/索引仍可能自愈），要享受原生压缩边界必须删掉旧目标重新导入。
+  `--force` 无效：identical-skip 在进写侧之前就早退。
+- **压缩轮的全量指纹跨 opencode 往返不保**：读回统一包成 `<cb_summary>`、多段用户文本并成一条
+  `summary`、空白归一，三处表示差使 `verify --strict` 报差异；**核心指纹收敛**，默认 verify 通过。
+  与 reasoning / native 同口径（`test/m88` 钉死）。
+- **mimo**（三表 classic 写侧）本次未改，其压缩摘要仍是普通用户文本，没有原生压缩边界。

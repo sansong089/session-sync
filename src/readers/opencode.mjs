@@ -89,7 +89,14 @@ function listOne(file, opts = {}) {
       .all();
     const counts = new Map();
     if (tableExists(db, 'session_message')) {
-      for (const r of db.prepare("SELECT session_id, COUNT(*) AS c FROM session_message WHERE type='user' GROUP BY session_id").all()) {
+      // completed 且有正文的 compaction 行读回是一轮，计数判据必须与 readOne 逐条对应（list == read）
+      const sql = `SELECT session_id, COUNT(*) AS c FROM session_message
+        WHERE type='user'
+           OR (type='compaction' AND json_extract(data,'$.status')='completed'
+               AND typeof(json_extract(data,'$.summary'))='text'
+               AND length(trim(json_extract(data,'$.summary')))>0)
+        GROUP BY session_id`;
+      for (const r of db.prepare(sql).all()) {
         counts.set(r.session_id, r.c);
       }
     }
@@ -154,8 +161,18 @@ function readOne(file, id) {
         entries.push({ role: 'user', ts, items });
       } else if (m.type === 'assistant') {
         entries.push({ role: 'assistant', ts, items: contentItems(data.content, ts) });
+      } else if (m.type === 'compaction') {
+        // 宿主注入的压缩摘要：completed 且有正文才还原成**一轮**（写侧一条 compaction 行 = 源侧一轮）。
+        // 统一包成 <cb_summary>，源侧用哪种标签都不影响核心指纹（coreItem 两侧都剥到内层正文），
+        // 且本会话再导出到 minimax 时仍能被认成系统事件而不是用户提问。
+        const summary = typeof data?.summary === 'string' ? data.summary : '';
+        if (data?.status === 'completed' && summary.trim()) {
+          const text = stripSystemInjections(`<cb_summary>${summary}</cb_summary>`);
+          if (text) entries.push({ role: 'user', ts, items: [messageItem('user', text, ts)] });
+        }
       }
-      // synthetic / system / compaction / idle / model-switched / agent-switched / location-switched：机械事件，跳过
+      // synthetic / system / idle / model-switched / agent-switched / location-switched：机械事件，跳过
+      // （compaction 的 running / failed 同样跳过：没有摘要正文，不是一轮）
     }
 
     const turns = assembleTurns(entries);

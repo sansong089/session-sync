@@ -369,7 +369,7 @@ qoder / cline / kilo / codebuddy 是「各形态各自一个根」，antigravity
 | --- | --- | --- |
 | 正文格式 | SQLite | 【源码】 |
 | 编码与加密 | `session_message.data` 内联 JSON，`content[]` 嵌在消息行里；`session_v2.model` 要么是完整 `Model.Ref`（`{id, providerID}`）要么 NULL，半截 JSON 会让列表编码失败 | 【源码】 |
-| 压缩与多帧 | —（无） | 【源码】 |
+| 压缩与多帧 | 压缩摘要 = `session_message` 的 `type='compaction'` 行，正文在 `data.summary`；宿主取**最新一条 `status='completed'`** 的行当历史边界，只重放它之后的消息。不带 `native.messages`/`providerContext` 的是本地摘要，**与模型无关**（换任何模型都成边界）；`status='running'/'failed'`、摘要非字符串或全空白的行不成边界、也不算一轮 | 【源码】 |
 | 解码要点 | —（SQLite 直读） | 【源码】 |
 
 ### V6 数据结构
@@ -423,7 +423,7 @@ qoder / cline / kilo / codebuddy 是「各形态各自一个根」，antigravity
 | --- | --- | --- | --- | --- |
 | `id` | `TEXT` | PK | — | 记录 ID |
 | `session_id` | `TEXT` | NOT NULL | — | 所属会话 ID |
-| `type` | `TEXT` | NOT NULL | — | 类型 |
+| `type` | `TEXT` | NOT NULL | — | 消息类型：`user` / `assistant` / `compaction`（压缩摘要，成历史边界）/ `synthetic` / `system` / `skill` / `shell` / `idle` / `agent-switched` / `model-switched` / `location-switched` |
 | `seq` | `INTEGER` | NOT NULL | — | — |
 | `time_created` | `INTEGER` | NOT NULL | — | 创建时间 |
 | `time_updated` | `INTEGER` | NOT NULL | — | 更新时间 |
@@ -501,7 +501,7 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
 | 存储实体 | `session_v2`（会话）/ `session_message`（消息）/ `project`（项目）/ `event_sequence`（消息 seq 计数器），逐列结构见下方表结构 | 【源码】 |
-| 关键列与约束 | assistant 消息必填 `agent`（字符串）与完整 `model`；`finish` ∈ `stop`/`length`/`tool-calls`/`content-filter`/`error`/`unknown`（**缺它即被当成被截断的流**，见上方字段契约）；`content[].tool` 必填 `time.created`，`state` ∈ `completed`/`error`/…，`completed` 要求 `input` 为对象、`content` 为非空数组；工具另有 `executed`（本地执行为 `false`）与 `time.ran`。**会话 ID 另有网关续写契约**：本地 schema 只校验 `ses` 前缀，但 Zen 网关要求宿主原生 Identifier 形态 `ses_`+12hex（降序时间戳，`r=now*0x1000+counter` 取 `~r` 低 48 位六字节）+14base62 共 26 位、且前缀解出 sane 时间戳；`ses_<32hex>` 列表可见却续写 429（与体量/provenance/model 无关，截断小消息仍 429、len26 前缀全 0 也 429） | 【源码】【真机】 |
+| 关键列与约束 | assistant 消息必填 `agent`（字符串）与完整 `model`；`finish` ∈ `stop`/`length`/`tool-calls`/`content-filter`/`error`/`unknown`（**缺它即被当成被截断的流**，见上方字段契约）；`content[].tool` 必填 `time.created`，`state` ∈ `completed`/`error`/…，`completed` 要求 `input` 为对象、`content` 为非空数组；工具另有 `executed`（本地执行为 `false`）与 `time.ran`。**会话 ID 另有网关续写契约**：本地 schema 只校验 `ses` 前缀，但 Zen 网关要求宿主原生 Identifier 形态 `ses_`+12hex（降序时间戳，`r=now*0x1000+counter` 取 `~r` 低 48 位六字节）+14base62 共 26 位、且前缀解出 sane 时间戳；`ses_<32hex>` 列表可见却续写 429（与体量/provenance/model 无关，截断小消息仍 429、len26 前缀全 0 也 429）。**`compaction` 行**必填 `status='completed'`、`reason` ∈ `auto`/`manual`、`summary`（字符串）与 `time.created`，`model`/`native`/`cost`/`tokens`/`metadata` 可选；判别器来自行的 `type` 列（宿主解码时注入），**`data` 内不放 `type`**；任一行形状不合规会让**整条会话**解码失败，不只是该轮读不出 | 【源码】【真机】 |
 | 标题落点 | `session_v2`（见下方表结构） | 【源码】 |
 
 ### V7 可见性与索引契约

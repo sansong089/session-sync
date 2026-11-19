@@ -77,8 +77,19 @@ function assertWrittenMessageContract(db, sessionId) {
   const rows = db.prepare('SELECT type, data FROM session_message WHERE session_id = ? ORDER BY seq').all(sessionId);
   let assistants = 0;
   for (const m of rows) {
-    assert.ok(m.type === 'user' || m.type === 'assistant', `未知消息类型 ${m.type}`);
+    assert.ok(m.type === 'user' || m.type === 'assistant' || m.type === 'compaction', `未知消息类型 ${m.type}`);
     const d = JSON.parse(m.data);
+    if (m.type === 'compaction') {
+      // 宿主注入的压缩摘要：最新一条 completed 行是历史边界，形状不对会让整条会话解码失败（orDie）
+      assert.ok(!('type' in d), '判别器来自行的 type 列（上游 rowInput 注入），data 内不得放 type');
+      assert.equal(d.status, 'completed');
+      assert.ok(d.reason === 'auto' || d.reason === 'manual', `reason 必须是 auto/manual：${d.reason}`);
+      assert.equal(typeof d.summary, 'string');
+      assert.ok(d.summary.trim(), 'summary 必须有正文（空摘要读侧会跳过 → 丢一轮）');
+      assert.ok(!('native' in d) && !('providerContext' in d), '本地摘要才无条件成边界');
+      assert.ok(Number.isFinite(d.time?.created), 'compaction.time.created 必填');
+      continue;
+    }
     if (m.type === 'user') {
       assert.equal(typeof d.text, 'string');
       continue;
