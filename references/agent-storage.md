@@ -368,8 +368,8 @@ qoder / cline / kilo / codebuddy 是「各形态各自一个根」，antigravity
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
 | 正文格式 | SQLite | 【源码】 |
-| 编码与加密 | `session_message.data` 内联 JSON，`content[]` 嵌在消息行里；`session_v2.model` 要么是完整 `Model.Ref`（`{id, providerID}`）要么 NULL，半截 JSON 会让列表编码失败 | 【源码】 |
-| 压缩与多帧 | 压缩摘要 = `session_message` 的 `type='compaction'` 行，正文在 `data.summary`；宿主取**最新一条 `status='completed'`** 的行当历史边界，只重放它之后的消息。不带 `native.messages`/`providerContext` 的是本地摘要，**与模型无关**（换任何模型都成边界）；`status='running'/'failed'`、摘要非字符串或全空白的行不成边界、也不算一轮 | 【源码】 |
+| 编码与加密 | `session_message.data` 内联 JSON，`content[]` 嵌在消息行里；`session_v2.model` 要么是完整 `Model.Ref`（`{id, providerID}`）要么 NULL，半截 JSON 会让列表编码失败。user 消息的 `data.files[]` 必须是宿主 `Prompt.FileAttachment`：`{data: Base64 字符串, mime: 字符串, source:{type:'inline'} \| {type:'uri',uri:字符串}, name?, description?, mention?}`；`data` 允许空串，但 `source` 必须带合法 `type`，写成 `{url,type:'file'}` 这类近似形状会让整条消息解码失败 → 打开会话 HTTP 500。本地图片读成 Base64 走 inline，本地其它文件/远端 URL 走 `source.uri`（远端无字节时 `data:''` + `mime:'application/octet-stream'`）；单个附件上限 20MB | 【源码】【真机】 |
+| 压缩与多帧 | 压缩摘要 = `session_message` 的 `type='compaction'` 行，正文在 `data.summary`；宿主取**最新一条 `status='completed'`** 的行当历史边界，只重放它之后的消息。不带 `native.messages`/`providerContext` 的是本地摘要，**与模型无关**（换任何模型都成边界）；`status='running'/'failed'`、摘要非字符串或全空白的行不成边界、也不算一轮。跨宿主归一化口径：读侧把各家原生压缩形态（原生边界行 / `isCompactSummary` 结构标记 / `<cb_summary>` 等标签壳）剥成**裸摘要正文 + 压缩语义位**——正文与语义正交，写侧按目标原生形态（原生边界行 / 带壳行 / SystemEvent）还原；正文一字不丢，语义位不进指纹 | 【源码】【真机】 |
 | 解码要点 | —（SQLite 直读） | 【源码】 |
 
 ### V6 数据结构
@@ -1090,12 +1090,12 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 
 **【真机】 库全貌与用途分组**：
 
-**`workbuddy.db`** —— 库内共 **11 张表**：
+**`workbuddy.db`** —— 库内共 **18 张表**（新版宿主在初始 11 张表之上追加了 `spaces` / `space_folders` / `local_skills` / 技能同步与会话中断等表）：
 
 | 用途分组 | 表 |
 | --- | --- |
 | 会话与消息 | `session_usage`, `sessions` |
-| 项目与工作区 | `workspace_trust_decisions`, `workspaces` |
+| 项目与工作区 | `workspace_trust_decisions`, `workspaces`, `spaces`, `space_folders`（新版以 `spaces` 表达「项目 = 空间」，`sessions.space_id` 指向它） |
 | 事件与队列 | `automation_delivery_outbox`, `automation_runs`, `automation_runtime_state`, `automations` |
 | 迁移与元数据 | `__workbuddy_drizzle_migrations`, `migration_meta` |
 | 其他 | `buddy_snapshots` |
@@ -1155,6 +1155,7 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | `permission_mode` | `TEXT` | — | — | — |
 | `use_sandbox_cli` | `INTEGER` | — | — | — |
 | `project_id` | `TEXT` | — | — | 所属项目 ID |
+| `space_id` | `TEXT` | — | — | 所属空间 ID（新版「项目 = 空间」归属键，须命中 `spaces.id`；NULL 按 legacy 处理，侧栏项目页按它过滤） |
 | `plugin_context_json` | `TEXT` | — | — | — |
 | `last_user_prompt_expert_selection` | `TEXT` | — | — | — |
 | `context_window` | `INTEGER` | — | — | — |
@@ -1202,7 +1203,7 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
 | 项目判定 | cwd 形态命中 `<home>/WorkBuddy[ AI]*/<四种代际叶子>` 为非项目；`is_playground=1` 只作新版辅助 | 【真机】 |
-| 会话归属键 | `sessions.project_id` 存在但不作为项目名来源 | 【真机】 |
+| 会话归属键 | `sessions.project_id` 存在但不作为项目名来源；新版以 `sessions.space_id → spaces.id` 作为侧栏项目页的过滤键，项目会话的 `space_id` 必须为宿主已登记且 `status='active'` 的空间，留 NULL 时正文与索引都在、但项目下不显示。旧版宿主没有 `spaces` 表 / `space_id` 列时不适用，按目录与 cwd 判定即够 | 【真机】【源码】 |
 | 项目注册表 | —（目录即项目；`workspaces` 表以 `path` 为主键、与 session 无外键，按安装共享）。**项目键的目录形态 = 小写盘符**（宿主记自己的 cwd，本机 46/47 条实测，与 claude/pi 的大写相反）：与宿主记法不一致 → 另一个 `projects/<slug>` 目录 → 侧栏两个同名项目 | 【真机】 |
 | 非项目会话 | `<home>/WorkBuddy[ AI]/<hyphen6>` 形态的独立子目录（每会话一个） | 【真机】 |
 | 项目显示名 | UI 的「Rename Workspace」只改显示名、不改目录（宿主原文 `Only the display name changes. The actual folder path will stay the same.`），结果写 `<root>/workspace-display-names.json`，键为规范化路径 | 【真机】 |
@@ -3191,12 +3192,12 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | 变体 | 会话 ID 生成 | 新会话最小落点 | 追加语义 | 未知 type 容忍性 |
 | --- | --- | --- | --- | --- |
 | 1. opencode-v1 | 不可写（本程序不写） | — | — | —（不写则无容忍性问题） |
-| 2. opencode-v2 | `ses` 开头（裸 uuid 会编码失败） | `session_v2` 行 + `session_message` 行 + `event_sequence` 行（消息 seq 计数器，缺它宿主续写会撞 seq 唯一索引），`project_id` 须命中真实 `project` 行 | 服务端过滤任何不合规行即整页 500（严格 schema 校验） | 【源码】 严格校验：不合规行报 500，不存在「静默忽略」 |
+| 2. opencode-v2 | `ses` 开头（裸 uuid 会编码失败） | `session_v2` 行 + `session_message` 行 + `event_sequence` 行（消息 seq 计数器，缺它宿主续写会撞 seq 唯一索引），`project_id` 须命中真实 `project` 行；user 消息的 `files[]` 须是 `Prompt.FileAttachment`（`data`/`mime`/`source` 齐全） | 服务端过滤任何不合规行即整页 500（严格 schema 校验） | 【源码】 严格校验：不合规行报 500，不存在「静默忽略」 |
 | 3. claude | uuid | `projects/<slug>/<sessionId>.jsonl` 追加事件行（`uuid` / `parentUuid` 链、`sessionId`、`cwd`） | 追加须接在末行 `uuid` 之后（`parentUuid` 线性续接） | 【真机】 未知 `type` 行宿主忽略（见 §3 V6） |
 | 4. pi | uuid（内嵌文件名 `<ISO>_<id>.jsonl`） | `sessions/<slug>/<ISO>_<id>.jsonl`（首行 `session` 头） | —（单一文件即全部） | 【待证 待证-pi-1】 未知事件行的容忍性未取证 |
 | 5. antigravity | 不可写（steps 二进制无安全构造路径） | — | — | — |
 | 6. codex | uuid（`rollout-<ISO>-<uuid>.jsonl`） | rollout 文件 + `.codex-global-state.json` 读-改-写（注册表是可见性硬前置） | 追加进 `.jsonl.zst` 需整帧解压→追加→重压一帧→原子替换 | 【待证 待证-codex-2】 rollout 对未知事件行的容忍性未取证 |
-| 7–8. workbuddy-cn / workbuddy-intl | uuid | jsonl 正文 + `sessions` 表行（缺一不可，见 §7 V7） | 索引行缺失或落后则侧栏不列 | 【待证 待证-workbuddy-1】 未知事件行的容忍性未取证 |
+| 7–8. workbuddy-cn / workbuddy-intl | uuid | jsonl 正文 + `sessions` 表行（缺一不可，见 §7 V7）；新版有 `spaces` 表时，项目会话的 `sessions.space_id` 还须命中 active 空间，否则项目页不列（见 §8 V8） | 索引行缺失或落后则侧栏不列；`space_id` 留 NULL 则项目页不列 | 【待证 待证-workbuddy-1】 未知事件行的容忍性未取证 |
 | 9–10. qoder-cn / qoder-intl | 会话 id（CLI jsonl 文件名） | CLI jsonl + `chat_sessions` 行 + `chat_session_messages` 投影（`workspace_id` 须命中 `workspaces`） | 旧代 `local.db` 密文不可写 | 【待证 待证-qoder-1】 未知事件行的容忍性未取证 |
 | 11. zcode | `sess_<uuid>`（宿主校验正则） | 正文库 `session` / `message` / `part` 行 + 列表库 `tasks` 行（两库缺一不可） | 只写正文库不会出现在侧栏 | 【待证 待证-zcode-2】 未知 `session_entry` 行 / 列表库行的容忍性未取证 |
 | 12. mimo | uuid | `session` 行 + `message` / `part` 行（`project_id` 由 id 文件契约解析） | 自动导入表会话被宿主排除 | 【待证 待证-mimo-1】 未知部件行的容忍性未取证 |

@@ -204,7 +204,9 @@ test('读回：compaction 行还原成一轮，核心指纹逐轮相等、轮数
   assert.equal(back.turns.length, src.turns.length, '一条 compaction 行 = 一轮，不得多开或少开');
   assert.deepEqual(sessionCoreFingerprints(back), sessionCoreFingerprints(src), '核心指纹必须逐轮收敛');
   const summaryTurn = back.turns[1].items.find((it) => it.kind === 'message' && it.role === 'user');
-  assert.match(summaryTurn.text, /^<cb_summary>/, '读回统一包成 <cb_summary>（再导出到 minimax 仍认得是系统事件）');
+  // 统一归一化口径：text = 剥壳裸正文，compact:true 承载语义（正文与语义正交，导回任何宿主无损）
+  assert.equal(summaryTurn.text, SUM, '读回是裸摘要正文（无宿主标签壳）');
+  assert.equal(summaryTurn.compact, true, '压缩语义由 compact 位承载，不污染正文');
   assert.ok(summaryTurn.text.includes(SUM), '摘要正文完整读回');
   assert.equal(listSessions('opencode', ctx).sessions.find((s) => s.id === TARGET).turns, back.turns.length, 'list 计数 == read 轮数');
 });
@@ -401,7 +403,8 @@ test('原生 compaction 行（带 recent/cost/tokens/metadata）读回成一轮�
   const list = listSessions('opencode', ctx).sessions;
   const nat = opencodeReader.read(ctx, NATIVE_ID);
   assert.equal(nat.turns.length, 2, '原生 completed 摘要还原成一轮 + 用户一轮');
-  assert.equal(nat.turns[0].items[0].text, `<cb_summary>${SUM}</cb_summary>`);
+  assert.equal(nat.turns[0].items[0].text, SUM, '归一化裸正文，无标签壳');
+  assert.equal(nat.turns[0].items[0].compact, true, '压缩语义由 compact 位承载');
   assert.equal(list.find((s) => s.id === NATIVE_ID).turns, 2, 'list 计数必须与 read 一致');
   const badRead = opencodeReader.read(ctx, BAD_ID);
   assert.equal(badRead.turns.length, 1, 'running/failed/非字符串/全空白/缺 summary 都不算一轮');

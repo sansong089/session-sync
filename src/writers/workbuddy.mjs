@@ -13,6 +13,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { VARIANTS, workbuddyRoot } from '../hosts.mjs';
 import { writeSidecarProvenance } from '../provenance.mjs';
+import { compactionSummaryText } from '../text.mjs';
 import {
   newNodeId,
   readJsonlFile,
@@ -34,9 +35,9 @@ import { makeTitleSyncer } from './title-slots.mjs';
 import { fitTitleFor, TITLE_MAX } from '../titles.mjs';
 import { accountIdOf } from '../placement.mjs';
 import { currentAccount } from '../accounts.mjs';
-import { isDir } from '../util.mjs';
+import { cmpPath, isDir } from '../util.mjs';
 import { roleRoots, writeRootOf } from '../roots.mjs';
-import { tableColumns } from '../readers/base.mjs';
+import { tableColumns, tableExists } from '../readers/base.mjs';
 
 function projectsRoot(ctx, variant) {
   return writeRootOf(variant, ctx, 'projects')?.path ?? null;
@@ -63,9 +64,22 @@ function turnToEvents(turn, session) {
   // 逐块各发一条会把一轮拆成多轮，续写就会被误判成分叉
   let userBlocks = null;
   let userTs = 0;
+  let userCompact = false;
   const flushUser = () => {
-    if (userBlocks && userBlocks.length) events.push({ type: 'message', role: 'user', content: userBlocks, ts: userTs });
+    if (userBlocks && userBlocks.length) {
+      // 归一化 → workbuddy 原生：整轮都是压缩摘要时，正文包 <cb_summary> 壳 + compact 标记，
+      // emit 据此生成 cmp_ id / providerData（真机原生压缩行形态）。混排真实文本则兜底 plain user。
+      const ev = {
+        type: 'message', role: 'user', ts: userTs,
+        content: userCompact
+          ? userBlocks.map((b) => ({ ...b, text: `<cb_summary>${compactionSummaryText(b.text)}</cb_summary>` }))
+          : userBlocks,
+      };
+      if (userCompact) ev.compact = true;
+      events.push(ev);
+    }
     userBlocks = null;
+    userCompact = false;
   };
   const push = (ev) => {
     flushUser();
@@ -77,6 +91,9 @@ function turnToEvents(turn, session) {
       if (!userBlocks) {
         userBlocks = [];
         userTs = ts;
+        userCompact = it.compact === true;
+      } else if (it.compact !== true) {
+        userCompact = false;
       }
       userBlocks.push({ type: 'input_text', text: it.text });
       continue;
@@ -125,8 +142,23 @@ function buildLines(session, turns, targetId, startParent, provenance, opts = {}
   const model = session.model || null;
 
   const emit = (obj) => {
-    const id = newNodeId();
-    const line = { id, parentId: parent, ...obj, sessionId, cwd };
+    // 归一化 → workbuddy 原生压缩行：cmp_ 前缀 id + logicalParentId + 压缩 providerData 标记。
+    // 正文在 turnToEvents 已包 <cb_summary> 壳（真机原生形态），这里只补 id 与标记。
+    const compact = obj.compact === true;
+    const id = compact ? `cmp_${newNodeId()}` : newNodeId();
+    const { compact: _c, ...rest } = obj;
+    const line = {
+      id,
+      parentId: parent,
+      ...(compact ? { logicalParentId: parent } : {}),
+      ...rest,
+      sessionId,
+      cwd,
+    };
+    if (compact) {
+      const pd = typeof line.providerData === 'object' && line.providerData ? line.providerData : {};
+      line.providerData = { ...pd, isCompacted: true, isSummary: true, isCompactInternal: true, skipRun: true, compactType: 'pre-message-auto', compactionKind: 'auto', compactionTrigger: 'pre_message_threshold' };
+    }
     lines.push(line);
     parent = id;
     return line;
@@ -194,6 +226,41 @@ function isPlaygroundCwd(cwd) {
 }
 
 /**
+ * WorkBuddy 新版用 spaces 表做「项目 = 空间」归属：侧栏项目页按会话行的 space_id
+ * 过滤（宿主 matchesConversationFilter 的 spaceId 判据），我们导入的项目会话若把
+ * space_id 留成 NULL，正文和 sessions 行都写对了却不在任何项目下显示。
+ * 只认宿主自己登记、仍然 active 的空间；路径按 cmpPath 比（宿主 cwd 正反斜杠混用）。
+ * 认不到就留 NULL（宿主按 legacy 处理），绝不凭空造 space id —— 那是宿主自管实体。
+ */
+function matchSpaceId(db, cwd, scope) {
+  if (!cwd || scope === 'none' || !tableExists(db, 'spaces')) return null;
+  const cols = tableColumns(db, 'spaces');
+  if (!cols.includes('id')) return null;
+  const paths = ['primary_folder_path', 'create_folder_path'].filter((c) => cols.includes(c));
+  if (!paths.length) return null;
+  const where = [];
+  if (cols.includes('deleted_at')) where.push('(deleted_at IS NULL OR deleted_at < 0)');
+  if (cols.includes('status')) where.push("status = 'active'");
+  let rows;
+  try {
+    rows = db.prepare(`SELECT id, ${paths.join(', ')} FROM spaces${where.length ? ` WHERE ${where.join(' AND ')}` : ''}`).all();
+  } catch {
+    return null;
+  }
+  const key = cmpPath(cwd);
+  let fallback = null;
+  for (const r of rows) {
+    for (const p of paths) {
+      if (!r[p] || cmpPath(r[p]) !== key) continue;
+      // primary_folder_path 是空间的主目录，优先于历史 create_folder_path
+      if (p === 'primary_folder_path') return String(r.id);
+      fallback ??= String(r.id);
+    }
+  }
+  return fallback;
+}
+
+/**
  * 写/更新 sessions 索引行。
  * 只更新我们负责的列；user_id / is_playground 仅在新建时给值，已有行不动。
  * @returns {{ok:boolean, created?:boolean, skipped?:string, error?:string}}
@@ -210,10 +277,13 @@ export function upsertSessionIndex(ctx, variant, info) {
   }
 
   try {
-    if (!tableColumns(db, 'sessions').includes('id')) return { ok: true, skipped: 'sessions-table-absent' };
+    const scols = tableColumns(db, 'sessions');
+    if (!scols.includes('id')) return { ok: true, skipped: 'sessions-table-absent' };
 
     const id = String(info.targetId);
-    const existing = db.prepare('SELECT id FROM sessions WHERE id = ?').get(id);
+    const hasSpace = scols.includes('space_id');
+    const existing = db.prepare(`SELECT id${hasSpace ? ', space_id' : ''} FROM sessions WHERE id = ?`).get(id);
+    const spaceId = hasSpace ? matchSpaceId(db, info.cwd, info.scope ?? null) : null;
     const now = Date.now();
     const createdAt = info.createdAt || now;
     const updatedAt = info.updatedAt || now;
@@ -235,6 +305,8 @@ export function upsertSessionIndex(ctx, variant, info) {
         ['last_activity_at', updatedAt],
       ];
       if (info.model) sets.push(['model', info.model]);
+      // 存量导入行的索引自愈：只补我们自己写过的行里缺的 space_id，宿主原生行一律不动
+      if (hasSpace && spaceId && !existing.space_id && isImportedBody(ctx, variant, id)) sets.push(['space_id', spaceId]);
       updateRowFiltered(db, 'sessions', sets, { id });
       return { ok: true, created: false };
     }
@@ -270,6 +342,7 @@ export function upsertSessionIndex(ctx, variant, info) {
       ['source_mode', null],
       ['thought_level', null],
     ];
+    if (hasSpace && spaceId) wanted.push(['space_id', spaceId]);
     insertRowFiltered(db, 'sessions', wanted);
 
     return { ok: true, created: true, userId: picked.uid, userIdSource: picked.source, warnings: picked.warnings };
@@ -460,20 +533,34 @@ export function createWorkbuddyWriter({ variant }) {
     repair(ctx, { account = null } = {}) {
       const warnings = [];
       const dbFile = indexDbFile(ctx, variant);
-      if (!dbFile || !fs.existsSync(dbFile)) return { ok: true, retagged: 0, nativeUntouched: 0, warnings };
+      if (!dbFile || !fs.existsSync(dbFile)) return { ok: true, retagged: 0, nativeUntouched: 0, spaceFixed: 0, warnings };
       let db;
       try {
         db = openIndexDb(dbFile);
       } catch (err) {
-        return { ok: false, error: `index-db-open-failed: ${err?.message ?? err}`, retagged: 0, nativeUntouched: 0, warnings };
+        return { ok: false, error: `index-db-open-failed: ${err?.message ?? err}`, retagged: 0, nativeUntouched: 0, spaceFixed: 0, warnings };
       }
       try {
+        // 项目空间归属自愈：只补我们自己写过的行里空着的 space_id。
+        // 宿主原生行的 NULL 是它自己的 legacy 状态，一律不动。
+        let spaceFixed = 0;
+        if (tableColumns(db, 'sessions').includes('space_id')) {
+          const updSpace = db.prepare('UPDATE sessions SET space_id = ? WHERE id = ?');
+          for (const r of db.prepare('SELECT id, cwd, space_id FROM sessions').all()) {
+            if (r.space_id || !isImportedBody(ctx, variant, r.id)) continue;
+            const sid = matchSpaceId(db, r.cwd, null);
+            if (!sid) continue;
+            updSpace.run(sid, String(r.id));
+            spaceFixed++;
+          }
+        }
+        if (spaceFixed) warnings.push(`space-missing: 已给 ${spaceFixed} 条导入会话补上项目空间归属`);
         // --account 决定改标归属（与新建行同口径）；没有就取当前登录 uid
         const picked = pickUserId(ctx, variant, { account });
         const target = picked.source === 'target-default' ? null : picked.uid;
         if (!target) {
           warnings.push('account-snapshot-missing: 读不到 primary.uid，未改标任何行');
-          return { ok: true, retagged: 0, nativeUntouched: 0, warnings };
+          return { ok: true, retagged: 0, nativeUntouched: 0, spaceFixed, warnings };
         }
         const rows = db.prepare('SELECT id, user_id FROM sessions WHERE user_id IS NOT NULL').all();
         const upd = db.prepare('UPDATE sessions SET user_id = ? WHERE id = ?');
@@ -493,9 +580,9 @@ export function createWorkbuddyWriter({ variant }) {
         if (ours + native > 0) {
           warnings.push(`account-mismatch: 现库有 ${ours + native} 行属另一登录态，其中我们写的 ${ours} 行已改标，宿主原生 ${native} 行未动`);
         }
-        return { ok: true, retagged, nativeUntouched: native, warnings };
+        return { ok: true, retagged, nativeUntouched: native, spaceFixed, warnings };
       } catch (err) {
-        return { ok: false, error: `retag-failed: ${err?.message ?? err}`, retagged: 0, nativeUntouched: 0, warnings };
+        return { ok: false, error: `retag-failed: ${err?.message ?? err}`, retagged: 0, nativeUntouched: 0, spaceFixed, warnings };
       } finally {
         try {
           db.close();

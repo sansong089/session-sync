@@ -71,14 +71,17 @@ function replayEntries(lines) {
       case 'user': {
         const content = ev.message?.content;
         const items = [];
+        // 宿主注入的压缩摘要（qoder/claude 血统）：结构标记 isCompactSummary，正文是裸文本无标签壳。
+        // 归一化：text = 剥壳正文原样（本就无壳），compact:true 承载语义；正文一字不丢。
+        const compact = ev.isCompactSummary === true;
         if (typeof content === 'string') {
           const t = stripSystemInjections(content);
-          if (t) items.push(messageItem('user', t, ts));
+          if (t) items.push(messageItem('user', t, ts, compact));
         } else if (Array.isArray(content)) {
           for (const c of content) {
             if (c?.type === 'text' && c.text) {
               const t = stripSystemInjections(c.text);
-              if (t) items.push(messageItem('user', t, ts));
+              if (t) items.push(messageItem('user', t, ts, compact));
             } else if (c?.type === 'tool_result') {
               items.push(toolResultItem(c.tool_use_id ?? null, 'tool', c.is_error ? 'error' : 'ok', outputText(c.content), ts));
             } else if (c?.type === 'image') {

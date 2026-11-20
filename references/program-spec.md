@@ -317,11 +317,24 @@ WorkBuddy 的 `transport`/`unread`/`thought_level` 就不在 baseline 里 ——
   （`src/writers/opencode.mjs` 的 `turnToEvents`）。宿主把最新一条 completed 摘要当历史边界、
   只读它之后的消息，上下文估算随之变小 —— 写成普通 user 消息的话，超大导入会话续写时
   会被整体压平成一条超模型上下文的请求（网关判输入超长而拒绝）。读侧一条 compaction 行
-  还原成**一轮**（统一包成 `<cb_summary>`，`src/readers/opencode.mjs`），`list` 计数同判据。
+  还原成**一轮**（`data.summary` 裸正文 + 压缩语义位，`src/readers/opencode.mjs`），`list` 计数同判据。
   混排真实用户文本 / 带附件 / 剥壳后为空 → 兜底普通 user 行（空摘要读侧会跳过，写出去就丢一轮）。
   存量导入的摘要行不改写，要享受边界须删旧目标重导（见 `references/identity.md` 已知边界）。
+ - 压缩摘要跨宿主采用**统一归一化**：读侧把各家原生形态（opencode 原生边界行 / qoder 的
+   `isCompactSummary` 结构标记 / workbuddy 的 `<cb_summary>` 标签壳与 `cmp_` 行）剥成
+   「裸摘要正文 + 压缩语义位」——正文与语义正交，语义位不进 `coreItem`/`normalizeItem`（指纹只看正文，
+   故全链路稳定）；写侧按目标原生形态还原（原生边界行 / 原生标记行 / 带壳行 / SystemEvent），
+   正文一字不丢。这样 qoder→workbuddy→qoder 等往返正文逐字不变、压缩语义保留、核心指纹逐轮收敛。
+   混排真实文本 / 带附件 / 剥壳后为空的轮不按压缩处理（兜底普通 user），避免丢字或多开轮。
+   无原生压缩机制的宿主退化为普通 user 文本（正文照写，语义位靠内容标签壳表达）。
 - mimo 孤儿 `tool_result`：源侧有回执但同轮找不到调用时，只落一个 `state.input=null` 的 tool 部件，
   读侧不得据此再补一个 `tool_call`（会让核心指纹多一项）。
+- workbuddy 项目会话必须写宿主空间归属：`sessions.space_id` 按 cwd 认领已登记且 active 的
+  `spaces.id`（路径按统一分隔符/大小写比较，优先 `primary_folder_path`，再
+  `create_folder_path`），新建行写入、存量导入行仅在为空时补；认不到保持 NULL（宿主按 legacy 处理），
+  宿主原生行与非空归属一律不覆盖。侧栏项目页按 `space_id` 过滤，留 NULL 会出现「正文与索引都在、
+  但项目下不显示」。旧版宿主没有 `spaces` 表或 `sessions.space_id` 列时，整段判据按存在性自动跳过，
+  写入/自愈行为与修复前完全一致（真机旧形态与端到端回归见 m90）。
 - qoder 三层写入：CLI 正文 jsonl + `main.sqlite` 的 `chat_sessions` 行 + `chat_session_messages` 投影；
   旧代 `local.db` 是上一代密文存储，只降级读、不参与写入。
 - opencode 自愈：`import --apply` 在写入前对历史导入行做一次性迁移 —— 裸 uuid / `ses_<32hex>`
@@ -334,6 +347,13 @@ WorkBuddy 的 `transport`/`unread`/`thought_level` 就不在 baseline 里 ——
   `native` 包裹与 `time`、assistant 补 `rawFinish`/`cost`/`tokens`/`time.streamed` 同形字段、
   带 provenance 的行 `version` 对齐宿主版本（无 metadata 的行保留 `session-sync/1` 识别标记）。
   原生会话（无来源标记）永不触碰。
+- opencode 的 user 附件必须是宿主 `Prompt.FileAttachment`（`data` Base64、`mime`、
+   `source:{type:'inline'}|{type:'uri',uri}`）：近似形状会让整条消息解码失败，打开会话 500。
+   写侧（`turnToEvents`）按引用取字节：本地图片读成 Base64 走 inline，本地其它文件走
+   `source.uri` + `data`；远端 URL / 不可读或超大文件用 `data:''` + `mime:'application/octet-stream'`
+   + `source.uri` 兜底（空 Base64 合法，且不会被当成空图片重放）。历史坏行（ `{url,type:'file'}` ）
+   在自愈侧 `repairMessageData` 里按同一口径改写；读侧优先从 `source.uri` 还原引用，兼容历史 `url`。
+   验证见 m89。
 - opencode 会话 ID 必须是宿主原生 Identifier 形态（`ses_`+12hex 降序时间戳+14base62，共 26 位）：
   本地 schema 只校验 `ses` 前缀，`ses_<32hex>` 能过本地校验、列表也显示，但 **Zen 网关续写时
   回 `FreeUsageLimitError(429)`**——与真实配额、历史体量、provenance、model 均无关（真机交叉

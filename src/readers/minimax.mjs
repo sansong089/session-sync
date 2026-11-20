@@ -12,6 +12,7 @@ import path from 'node:path';
 import { VARIANTS, configRoot, userDataDirsOf } from '../hosts.mjs';
 import { makeSession, messageItem, reasoningItem, toolCallItem, toolResultItem, attachmentItem, metaItem, noteItem, finalizeSession } from '../ir.mjs';
 import { toPiBlock, toolResultItemOfRow } from '../pi-agent-blocks.mjs';
+import { compactionInjectionKind, compactionSummaryText } from '../text.mjs';
 import { provenanceFromObject, applyProvenanceToIR, readSidecarProvenance } from '../provenance.mjs';
 import { openDb, safeJson, tableExists, tableColumns, firstExisting, assembleTurns, deriveTitle, stripSystemInjections, parseJsonl, readHead, readTail, toMs, fileMtime, fileSize, inTimeRange,
   parseArgs, outputText,
@@ -208,7 +209,12 @@ function toEntry(rec, fallbackTs) {
       if (!b) continue;
       if (b.type === 'text') {
         const t = role === 'user' ? stripSystemInjections(b.text) : b.text;
-        if (t) items.push(messageItem(role, t, ts));
+        if (t) {
+          // 归一化：compact 位（新口径）或内容标签壳（旧口径）→ 剥壳裸正文 + compact 位
+          const compact = (c.compact === true || b.compact === true || compactionInjectionKind(t) !== null) && role === 'user';
+          const body = compact ? compactionSummaryText(t) : t;
+          if (body.trim()) items.push(messageItem(role, body, ts, compact));
+        }
       } else if (b.type === 'thinking') {
         if (b.thinking) items.push(reasoningItem(b.thinking, ts));
       } else if (b.type === 'tool_use') {

@@ -205,7 +205,8 @@ originKey = "<origin.variant>:<origin.sessionId>"
 - **存量导入的压缩摘要**：规范化之前写入的摘要仍是普通 user 行，新核心指纹只让复跑判 `skip(identical)`
   （**正文行不改写**，落点/标题/索引仍可能自愈），要享受原生压缩边界必须删掉旧目标重新导入。
   `--force` 无效：identical-skip 在进写侧之前就早退。
-- **压缩轮的全量指纹跨 opencode 往返不保**：读回统一包成 `<cb_summary>`、多段用户文本并成一条
-  `summary`、空白归一，三处表示差使 `verify --strict` 报差异；**核心指纹收敛**，默认 verify 通过。
+- **压缩轮的全量指纹跨宿主往返不保**：读回是裸摘要正文 + 压缩语义位（语义位不进全量指纹），
+  但多段用户文本并成一条 `summary`、空白归一等表示差仍使 `verify --strict` 报差异；
+  **核心指纹收敛**，默认 verify 通过。
   与 reasoning / native 同口径（`test/m88` 钉死）。
 - **mimo**（三表 classic 写侧）本次未改，其压缩摘要仍是普通用户文本，没有原生压缩边界。

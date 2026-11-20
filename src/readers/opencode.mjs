@@ -156,19 +156,22 @@ function readOne(file, id) {
         const userText = stripSystemInjections(data.text);
         if (userText) items.push(messageItem('user', userText, ts));
         for (const f of data.files || []) {
-          items.push(attachmentItem(f.url ?? f.path ?? f.name ?? '', 'user file', ts));
+          // 宿主原生 FileAttachment 把引用放在 source.uri；历史导入写成 {url,type:'file'}。
+          // 两者都认，往返时引用不丢。
+          items.push(attachmentItem(f.source?.uri ?? f.url ?? f.path ?? f.name ?? '', 'user file', ts));
         }
         entries.push({ role: 'user', ts, items });
       } else if (m.type === 'assistant') {
         entries.push({ role: 'assistant', ts, items: contentItems(data.content, ts) });
       } else if (m.type === 'compaction') {
         // 宿主注入的压缩摘要：completed 且有正文才还原成**一轮**（写侧一条 compaction 行 = 源侧一轮）。
-        // 统一包成 <cb_summary>，源侧用哪种标签都不影响核心指纹（coreItem 两侧都剥到内层正文），
-        // 且本会话再导出到 minimax 时仍能被认成系统事件而不是用户提问。
+        // 归一化口径：text = data.summary 原样（宿主原生正文，无标签壳），compact:true 承载语义。
+        // 正文与语义正交 → 导回任何宿主时写侧按目标原生形态还原，正文一字不丢。
+        // coreItem 对裸正文剥壳是恒等变换，核心指纹稳定；compact 位不进指纹（normalizeItem/coreItem 都不读）。
         const summary = typeof data?.summary === 'string' ? data.summary : '';
         if (data?.status === 'completed' && summary.trim()) {
-          const text = stripSystemInjections(`<cb_summary>${summary}</cb_summary>`);
-          if (text) entries.push({ role: 'user', ts, items: [messageItem('user', text, ts)] });
+          const text = stripSystemInjections(summary);
+          if (text) entries.push({ role: 'user', ts, items: [messageItem('user', text, ts, true)] });
         }
       }
       // synthetic / system / idle / model-switched / agent-switched / location-switched：机械事件，跳过

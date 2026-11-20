@@ -143,7 +143,9 @@ function itemToBlock(it, turnRole) {
   const role = it.role === 'user' || it.role === 'assistant' ? it.role : it.kind === 'message' ? turnRole : 'assistant';
   switch (it.kind) {
     case 'message':
-      return { type: 'text', text: it.text ?? '', role };
+      // 携带 compact 语义位：minimax 无独立压缩语义列，写侧据此标 SystemEvent 并补回 <cb_summary> 壳，
+      // 让读侧（靠内容标签认压缩）+ 宿主都能认出，正文一字不丢。
+      return { type: 'text', text: it.text ?? '', role, ...(it.compact ? { compact: true } : {}) };
     case 'reasoning':
       return { type: 'thinking', thinking: it.text ?? '', role };
     case 'tool_call':
@@ -221,10 +223,14 @@ function messageRowOf(frame, { turnId, ts, targetId }) {
   const toolCalls = hostToolCalls(frame.blocks);
   const attachments = hostAttachments(frame.blocks);
   // 宿主注入的压缩摘要是「系统事件」，不是用户提问：标 SystemEvent，宿主才不会把它显示成用户气泡。
-  // 判据按**内容**（<cb_summary> 等标签）而不是 WorkBuddy 私有的 providerData ——
-  // 私有标记换宿主就没了，按内容判两侧才一致（循环往返才不会误判分叉）。
-  const isSystemEvent = frame.blocks.some((b) => b.type === 'text' && compactionInjectionKind(b.text));
+  // minimax 无独立压缩语义列，读侧靠内容标签认 → 写侧两件事都要做：
+  //   ① isSystemEvent 认 compact 位（归一化新口径）或内容标签（旧 reader / 兼容回退）；
+  //   ② 正文是归一化裸正文（compact 位）时补回 <cb_summary> 壳，让宿主/读侧认得出。
+  // 'session-sync-content' 里保留裸正文，读侧据此无损还原（不丢字）。
+  const compactBlock = frame.blocks.find((b) => b.type === 'text' && b.compact === true);
+  const isSystemEvent = !!compactBlock || frame.blocks.some((b) => b.type === 'text' && compactionInjectionKind(b.text));
   const msgType = isSystemEvent ? 3 : toolCalls.length ? 2 : 1;
+  const msgContent = compactBlock && !compactionInjectionKind(text) ? `<cb_summary>${text}</cb_summary>` : text;
   return [
     ['session_id', String(targetId)],
     ['msg_id', msgId],
@@ -238,7 +244,7 @@ function messageRowOf(frame, { turnId, ts, targetId }) {
       timestamp: ts,
       role: frame.role,
       msg_type: msgType,
-      msg_content: text,
+      msg_content: msgContent,
       ...(thinking ? { thinking_content: thinking } : {}),
       ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
       ...(attachments.length ? { attachments } : {}),

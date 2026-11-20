@@ -70,14 +70,35 @@ function turnToEvents(turn, session) {
   // 逐块各发一条会把一轮拆成多轮，续写就会被误判成分叉
   let userBlocks = null;
   let userTs = 0;
+  let userCompact = false;
   const flushUser = () => {
-    if (userBlocks && userBlocks.length) events.push({ type: 'user', content: userBlocks, ts: userTs });
+    if (userBlocks && userBlocks.length) {
+      // 归一化：compact:true 的压缩轮还原成 qoder/claude 原生形态 —— user 裸正文原样 +
+      // isCompactSummary:true，并配一条 system compact_boundary 行（真机成对两行）。
+      // 正文与语义正交：text 一字不丢，语义靠标记承载，导回后宿主仍认得是压缩边界。
+      const ev = { type: 'user', content: userBlocks, ts: userTs };
+      if (userCompact) {
+        ev.isCompactSummary = true;
+        ev.isVisibleInTranscriptOnly = true; // 真机压缩 user 行带此标记：只在 transcript 可见、不冒充提问气泡
+      }
+      events.push(ev);
+      if (userCompact) events.push({
+        type: 'system', subtype: 'compact_boundary', content: 'Conversation compacted', level: 'info',
+        isCompactSummary: true,
+        compactMetadata: { trigger: 'auto', preTokens: 0, postTokens: 0, messagesSummarized: 0, durationMs: 0 },
+        ts: userTs,
+      });
+    }
     userBlocks = null;
+    userCompact = false;
   };
-  const pushUser = (c, ts) => {
+  const pushUser = (c, ts, compact = false) => {
     if (!userBlocks) {
       userBlocks = [];
       userTs = ts;
+      userCompact = compact;
+    } else if (!compact) {
+      userCompact = false; // 混排真实文本 → 整轮不按压缩处理（兜底 plain user）
     }
     userBlocks.push(c);
   };
@@ -93,7 +114,7 @@ function turnToEvents(turn, session) {
         if (isUserText) {
           flushAssistant();
           flushResults();
-          pushUser({ type: 'text', text: it.text }, ts);
+          pushUser({ type: 'text', text: it.text }, ts, it.compact === true);
         } else if (it.text) {
           pushBuf({ type: 'text', text: it.text }, ts);
         }
@@ -155,8 +176,14 @@ function buildLines(session, turns, targetId, startParent, provenance, opts = {}
 
   for (const turn of turns) {
     for (const ev of turnToEvents(turn, session)) {
-      if (ev.type === 'user') emit({ type: 'user', message: { role: 'user', content: ev.content }, ts: ev.ts });
-      else emit({ type: 'assistant', message: { role: 'assistant', model, content: ev.content }, ts: ev.ts });
+      if (ev.type === 'system') {
+        // 压缩配对的 compact_boundary system 行原样透传（真机 qoder 成对两行的第一行）
+        emit(ev);
+      } else if (ev.type === 'user') {
+        emit({ type: 'user', message: { role: 'user', content: ev.content }, ...(ev.isCompactSummary ? { isCompactSummary: true } : {}), ts: ev.ts });
+      } else {
+        emit({ type: 'assistant', message: { role: 'assistant', model, content: ev.content }, ts: ev.ts });
+      }
     }
   }
 

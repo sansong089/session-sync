@@ -59,7 +59,10 @@ export function makeTurn(role, items = [], startedAt = 0) {
 }
 
 // ---- Item 构造 ----
-export const messageItem = (role, text, ts = 0) => ({ kind: ItemKind.Message, role, text: String(text ?? ''), ts });
+// compact:true = 这条 user 消息是宿主注入的压缩摘要（归一化语义位）。
+// 正文 text 存「剥掉宿主标签壳后的摘要原文」，与语义位正交：读侧剥壳+置位，写侧按目标原生形态还原。
+// 该位不进 normalizeItem / coreItem（指纹只看正文），故全链路比较稳定；第 4 参数默认 false，向后兼容。
+export const messageItem = (role, text, ts = 0, compact = false) => ({ kind: ItemKind.Message, role, text: String(text ?? ''), ts, ...(compact ? { compact: true } : {}) });
 export const reasoningItem = (text, ts = 0) => ({ kind: ItemKind.Reasoning, text: String(text ?? ''), ts });
 export const toolCallItem = (callId, name, input, ts = 0) => ({ kind: ItemKind.ToolCall, callId: callId ?? null, name: name ?? '', input: input ?? null, ts });
 export const toolResultItem = (callId, name, status, output, ts = 0) => ({ kind: ItemKind.ToolResult, callId: callId ?? null, name: name ?? '', status: status ?? 'ok', output: output ?? null, ts });

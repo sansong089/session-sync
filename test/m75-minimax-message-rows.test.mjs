@@ -147,10 +147,11 @@ test('压缩摘要：标 SystemEvent 不冒充用户提问，正文一个字不�
   assert.match(d.msg_content, /^<cb_summary>/, '摘要正文一个字都不能少');
   assert.match(d.msg_content, /<\/cb_summary>$/);
 
-  // 读回来仍在，且原文完整
+  // 读回来仍在，且原文完整（统一归一化口径：裸正文 + compact 位，标签壳不进正文）
   const back = readSession('minimax', ctx, res.targetId).session;
-  const texts = back.turns.flatMap((t) => t.items.filter((i) => i.kind === 'message').map((i) => i.text));
-  assert.ok(texts.some((t) => t.includes('<cb_summary>') && t.includes('已完成')), '摘要必须完整读回');
+  const compactItems = back.turns.flatMap((t) => t.items).filter((i) => i.kind === 'message' && i.compact);
+  assert.ok(compactItems.length >= 1, '压缩摘要读回仍带 compact 语义位');
+  assert.ok(compactItems.some((i) => i.text.includes('Summary of the conversation so far') && i.text.includes('已完成')), '摘要正文必须完整读回（剥壳裸正文）');
 });
 
 test('压缩后的「请基于摘要继续」提示（无标签）同样标 SystemEvent', () => {

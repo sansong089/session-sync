@@ -359,7 +359,7 @@ function cmdShow(args, asJson) {
       turns: s.turns.map((t) => ({
         index: t.index,
         role: t.role,
-        items: t.items.map((i) => ({ kind: i.kind, text: i.text?.slice(0, 200), name: i.name, key: i.key, value: i.value })),
+        items: t.items.map((i) => ({ kind: i.kind, text: i.text?.slice(0, 200), name: i.name, key: i.key, value: i.value, ...(i.compact ? { compact: true } : {}) })),
       })),
       meta: s.meta,
     }, true);

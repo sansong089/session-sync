@@ -10,6 +10,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { writeSidecarProvenance } from '../provenance.mjs';
 import { insertProjectRow } from './project.mjs';
 import { GLOBAL_PROJECT } from '../readers/base.mjs';
@@ -58,6 +59,84 @@ function toolContent(output) {
   return [{ type: 'text', text: outputText(output) ?? '' }];
 }
 
+// ---- user.files[] 必须是宿主 Prompt.FileAttachment（packages/schema/src/prompt.ts）----
+// {data: Base64, mime: string, source: {type:'inline'} | {type:'uri', uri:string}}。
+// 历史导入写的是 {url, type:'file'}，宿主解码整条 user 消息时直接抛错 →
+// GET .../message 500、会话打不开。data 允许空串（Base64 正则接受），所以远端 URL /
+// 读不到的大文件用 data:'' + 非媒体 mime + source.uri 兜底：消息可解码，也不会被当成空图片重放。
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // 宿主 MAX_ATTACHMENT_BYTES
+const MIME_BY_EXT = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+  '.webp': 'image/webp', '.bmp': 'image/bmp', '.svg': 'image/svg+xml', '.pdf': 'application/pdf',
+  '.txt': 'text/plain', '.json': 'application/json', '.md': 'text/markdown', '.zip': 'application/zip',
+};
+
+function mimeOf(file) {
+  return MIME_BY_EXT[path.extname(file).toLowerCase()] ?? 'application/octet-stream';
+}
+
+function localFilePath(ref, cwd) {
+  const raw = String(ref ?? '').trim();
+  if (!raw) return null;
+  if (/^file:\/\//i.test(raw)) {
+    try {
+      return fileURLToPath(raw);
+    } catch {
+      return null;
+    }
+  }
+  // Windows 绝对路径（C:\… / C:/…）也带 `C:` 前缀，必须先按绝对路径认，
+  // 否则会被下面的 scheme 判据误当成远端 URL。
+  if (path.isAbsolute(raw)) return raw;
+  // http(s) / data: / 其它 scheme 一律当远端引用，不试图读本地文件
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) return null;
+  return cwd ? path.resolve(String(cwd), raw) : null;
+}
+
+function fileUriOf(file) {
+  try {
+    return pathToFileURL(path.resolve(file)).toString();
+  } catch {
+    return null;
+  }
+}
+
+function fileAttachmentOf(ref, cwd) {
+  const raw = String(ref ?? '').trim();
+  // URL 的 query（OSS 签名参数）不是文件名，剥掉再取 basename
+  const withoutQuery = raw.split(/[?#]/, 1)[0];
+  const name = path.basename(withoutQuery.replace(/[\\/]+$/, '')) || 'attachment';
+  const file = localFilePath(raw, cwd);
+  let data = '';
+  let mime = 'application/octet-stream';
+  let source = { type: 'uri', uri: fileUriOf(file) ?? raw ?? 'attachment' };
+  if (file) {
+    try {
+      const st = fs.statSync(file);
+      if (st.isFile() && st.size <= MAX_ATTACHMENT_BYTES) {
+        data = fs.readFileSync(file).toString('base64');
+        mime = mimeOf(file);
+        source = /^image\//.test(mime) ? { type: 'inline' } : { type: 'uri', uri: fileUriOf(file) ?? source.uri };
+      }
+    } catch {
+      /* 文件消失/无权限：保留 uri 引用，至少消息能解码 */
+    }
+  }
+  return { data, mime, source, name };
+}
+
+function isValidFileAttachment(f) {
+  return isPlainObject(f) && typeof f.data === 'string' && typeof f.mime === 'string' &&
+    isPlainObject(f.source) &&
+    (f.source.type === 'inline' || (f.source.type === 'uri' && typeof f.source.uri === 'string'));
+}
+
+function attachmentRefOf(f) {
+  if (typeof f === 'string') return f;
+  if (!isPlainObject(f)) return '';
+  return f.url ?? f.path ?? f.uri ?? f.source?.uri ?? f.name ?? '';
+}
+
 // 上游 FinishReason（packages/schema/src/llm.ts）：stop | length | tool-calls |
 // content-filter | error | unknown。
 //
@@ -91,20 +170,22 @@ function turnToEvents(turn, session, modelRef) {
   const events = [];
   // 一轮的用户文本/附件全部收进轮首的一条 user 事件：读侧「一条 user 消息 = 一轮」，
   // 用户文本与 reasoning/工具在同一轮里交错时逐段发出会把一轮拆成多轮
-  const userItems = (turn.items ?? []).filter((it) => (it.kind === 'message' && it.role === 'user') || it.kind === 'attachment');
-  const userTexts = userItems.filter((it) => it.kind === 'message').map((it) => it.text);
-  const userFiles = userItems.filter((it) => it.kind === 'attachment' && it.ref).map((it) => ({ url: String(it.ref), type: 'file' }));
+  const userMsgs = (turn.items ?? []).filter((it) => it.kind === 'message' && it.role === 'user');
+  const userFiles = (turn.items ?? []).filter((it) => it.kind === 'attachment' && it.ref).map((it) => fileAttachmentOf(it.ref, session.cwd));
   const firstUserTs = Number((turn.items ?? []).find((it) => it.ts)?.ts) || session.updatedAt || session.createdAt;
   // 宿主注入的压缩摘要落成**原生 compaction 行**：宿主把最新一条 completed 摘要当历史边界，
   // 只读它之后的消息（上游 history.ts latestCompaction / messageEntries），上下文估算随之变小。
   // 写成普通 user 消息的话，超大导入会话续写时会被整体压平成一条超模型上下文的请求（400003）。
   // 摘要正文一个字不丢，只是不再冒充用户提问。
-  const stripped = userTexts.map(compactionSummaryText);
-  const summaryText = compactionSummaryText(userTexts.join('\n\n'));
-  const allCompaction =
-    stripped.some((s, i) => s !== userTexts[i]) &&
-    userTexts.every((t, i) => stripped[i] !== t || compactionInjectionKind(t));
-  // 混排真实用户文本 / 带附件 / 剥壳后为空 → 仍走普通 user 行：空摘要会被读侧跳过，写出去就丢一轮
+  //
+  // 归一化的两条来源（统一成裸正文存 data.summary）：
+  //   ① 读侧新口径：message.compact===true，text 已是剥壳裸正文 —— 原样取；
+  //   ② 兼容回退：旧 reader / 其它源把摘要带标签塞在 text 里（`compactionInjectionKind` 命中），剥壳取。
+  // 每段要么带 compact 位、要么是带标签摘要、要么是「请基于摘要继续」无标签提示 → 整轮都是压缩注入。
+  // 混排真实用户文本 / 带附件 / 剥壳后为空 → 仍走普通 user 行：空摘要会被读侧跳过，写出去就丢一轮。
+  const isCompactSegment = (it) => it?.compact === true || compactionInjectionKind(it?.text) !== null;
+  const allCompaction = userMsgs.length > 0 && userMsgs.every(isCompactSegment);
+  const summaryText = userMsgs.map((it) => compactionSummaryText(it.text)).join('\n\n');
   if (allCompaction && !userFiles.length && summaryText.trim()) {
     events.push({
       type: 'compaction',
@@ -118,8 +199,8 @@ function turnToEvents(turn, session, modelRef) {
         ...(modelRef ? { model: modelRef } : {}),
       },
     });
-  } else if (userTexts.length || userFiles.length) {
-    events.push({ type: 'user', ts: firstUserTs, data: { time: { created: firstUserTs }, text: userTexts.join('\n\n'), files: userFiles, agents: [] } });
+  } else if (userMsgs.length || userFiles.length) {
+    events.push({ type: 'user', ts: firstUserTs, data: { time: { created: firstUserTs }, text: userMsgs.map((it) => it.text).join('\n\n'), files: userFiles, agents: [] } });
   }
 
   let content = null;
@@ -622,7 +703,7 @@ function isValidToolContentItem(c) {
 // tool 部件缺 time.created。任一处不合 schema → 整条消息解码失败 → 会话打不开、
 // session export 500（server 日志 "failed to decode session message"）。
 // 只修复我们自己写出的 user/assistant 行；返回 null = 无需改动。
-function repairMessageData(type, data, fallbackTime = 0, modelRef = null) {
+function repairMessageData(type, data, fallbackTime = 0, modelRef = null, cwd = null) {
   if (!isPlainObject(data)) return null;
   let changed = false;
   const tick = Number.isFinite(data.time?.created) ? data.time.created : fallbackTime;
@@ -742,6 +823,15 @@ function repairMessageData(type, data, fallbackTime = 0, modelRef = null) {
         changed = true;
       }
     }
+    // 历史违规的 {url,type:'file'} 会让整条 user 消息解码失败（会话打开 500）。
+    // 合法附件原样保留；非法的按与写侧相同的口径转成 FileAttachment。
+    if (Array.isArray(data.files)) {
+      const files = data.files.map((f) => (isValidFileAttachment(f) ? f : fileAttachmentOf(attachmentRefOf(f), cwd)));
+      if (JSON.stringify(files) !== JSON.stringify(data.files)) {
+        data.files = files;
+        changed = true;
+      }
+    }
   } else {
     return null;
   }
@@ -762,7 +852,7 @@ function collectMessageFixes(db, importedRows, modelRefs = new Map()) {
       } catch {
         continue;
       }
-      const fixed = repairMessageData(m.type, parsed, Number(m.time_created) || 0, ref);
+      const fixed = repairMessageData(m.type, parsed, Number(m.time_created) || 0, ref, row.directory ? String(row.directory) : null);
       if (fixed) fixes.push({ id: String(m.id), data: JSON.stringify(fixed) });
     }
   }
