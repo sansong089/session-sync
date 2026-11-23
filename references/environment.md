@@ -64,7 +64,7 @@
 - **形态由入口证据判定**（可执行文件、安装目录、扩展目录），不由数据根反推；数据根可能被多形态共用。
 - **能力由落点上有什么决定**，形态只用于解释与提示：某形态的存储尚未接入时，如实报"未覆盖"，不拿另一形态的根去凑。
 - 各形态的数据根、入口与覆盖状态以 [`agent-storage.md`](agent-storage.md) 的「变体形态矩阵」为唯一事实源；本表只是它在判别维上的投影，`test/m76` 断言两者一致。
-- 形态维度目前只有 antigravity / codex / roo 三处存在取证缺口（见 §8），其余均为真机入口证据。
+- 形态维度目前只有 codex / roo 两处存在取证缺口（见 §8），其余均为真机入口证据；antigravity 三形态已由宿主源码常量与真机落点双向确认。
 
 ## 2. 五层信号
 
@@ -193,8 +193,9 @@
 | E-CURSOR-TRACE | S1 | CURSOR_TRACE_ID | — | product | 是 | cursor | 【源码】 |
 | E-CURSOR-AGENT | S1 | CURSOR_AGENT | — | product | 是 | cursor | 【源码】 |
 | E-FORM-ANTIGRAVITY-CLI | S2 | `~/.gemini/antigravity-cli/` | — | form | 是 | antigravity | 【真机】 |
-| E-FORM-ANTIGRAVITY-IDE | S2 | `%APPDATA%/Antigravity/` | — | form | 否 | antigravity | 【待证 待证-antigravity-1】 |
+| E-FORM-ANTIGRAVITY-IDE | S2 | `~/.gemini/antigravity-ide/`（宿主 paths.js 的 `IDE_NEW_DATA_DIR`） | — | form | 是 | antigravity | 【真机】 |
 | E-FORM-ANTIGRAVITY-DESKTOP | S2 | `<Programs>/antigravity/Antigravity.exe` | — | form | 是 | antigravity | 【真机】 |
+| E-FORM-ANTIGRAVITY-HUB | S2 | `~/.gemini/antigravity/`（宿主 paths.js 的 `IDE_OLD_DATA_DIR`，现为 Hub 活库） | — | form | 是 | antigravity | 【真机】 |
 | E-FORM-CODEX-CLI | S2 | `~/.codex/` | — | form | 是 | codex | 【真机】 |
 | E-FORM-CODEX-IDE | S2 | VS Code 系扩展的 Codex 目录 | — | form | 否 | codex | 【待证 待证-codex-3】 |
 | E-FORM-CODEX-DESKTOP | S2 | ChatGPT 桌面端的 Codex 视图 | — | form | 否 | codex | 【待证 待证-codex-3】 |
@@ -254,7 +255,7 @@ freebuff / workbuddy 等），判出形态也不改变写入位置，登记它�
 | 待证-workbuddy-3 | 国际版是否导出 `WORKBUDDY_CONFIG_DIR` 且值为 `.workbuddy-ai`（中文版已确认值为 `.workbuddy`） | 国际版的 edition 判别当前只有源码结论，缺真机样本 |
 | 待证-qoder-1 | 国际版是否导出 `QODER_CONFIG_DIR` 且值为 `.qoder` | 国际版目前靠排除法兜底 |
 | 待证-qoder-2 | 中文版是否导出 `QODER_HOME` | 该判据只作辅助，不影响主链路 |
-| 待证-antigravity-1 | IDE 与桌面形态的会话根是否与 `~/.gemini/antigravity-cli/` 同源 | 目前只能判到「这是 antigravity」，判不出形态；读写只覆盖 CLI 形态 |
+| 待证-antigravity-1 | ~~IDE 与桌面形态的会话根是否与 `~/.gemini/antigravity-cli/` 同源~~（已结案） | 三形态不同源：CLI 在 `antigravity-cli/`，独立 IDE 在 `antigravity-ide/`（旧加密 `.pb`），桌面 Hub 在 `antigravity/`（新 `.db` + 摘要库，已接读写）。`%APPDATA%/Antigravity/` 仅 Electron userData，无会话正文 |
 | 待证-codex-3 | IDE 扩展与桌面入口是否复用 `~/.codex/` | 多形态并存时，形态维度无法收敛，`form` 只能报候选 |
 | 待证-workbuddy-4 | 中英版的 agent 工具子进程是否继承 `ACC_PRODUCT_CONFIG_PATH`（配置内容与 `dataFolderName` 已读到真机样本，缺「这个变量会不会出现在我们进程的环境里」） | 继承则 edition 有 S1 正面证据；不继承就只剩 `E-ENTRY-WB-PID-*` 一条路 |
 | 待证-workbuddy-5 | 归属文件名里的 pid 是否落在我们的祖先进程链上（宿主在哪个进程里加载配置未取证） | 不相交则 `E-ENTRY-WB-PID-*` 作废，双装 + 无 env 那一格只能 `ambiguous` |

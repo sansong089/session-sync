@@ -185,14 +185,15 @@ session-sync import --from codex --into <目标> --id <id> --apply
 
 ## 5. 能力边界（务必先跟用户说清）
 
-- **可写目标 18 家**：claude、pi、codex、codebuddy、codebuddy-ide、workbuddy-cn、workbuddy-intl、opencode、mimo、dsh、freebuff、cline、kilo、roo、zcode、minimax、qoder-cn、qoder-intl
+- **可写目标 19 家**：claude、pi、codex、codebuddy、codebuddy-ide、workbuddy-cn、workbuddy-intl、opencode、mimo、dsh、freebuff、cline、kilo、roo、zcode、minimax、qoder-cn、qoder-intl、antigravity
   （`roo` 与 cline/kilo 共用同一 writer，代码可写，但本机没有任何宿主内成功样本 —— 给用户承诺前要说清这一点；
   `codebuddy` 指 CodeBuddy Code CLI，会话在 `~/.codebuddy/projects/`；`codebuddy-ide` 指 CodeBuddy IDE / VS Code 插件，
-  写入按其真实扩展缓存结构落盘，已在腾讯 CodeBuddy CN 1.106.1.0 做过 GUI 列表现场验收）
-- **只读 3 家**（能作源，不能作目标，原因见 `references/agent-storage.md` 对应变体 V6 / V7）：
-  - `antigravity`：steps 是 protobuf 二进制，无安全写入路径
+  写入按其真实扩展缓存结构落盘，已在腾讯 CodeBuddy CN 1.106.1.0 做过 GUI 列表现场验收；
+  `antigravity` 只写桌面 Hub（`~/.gemini/antigravity/` 正文库 + 侧栏摘要库双写），CLI/IDE 根不会成为目标）
+- **只读 2 家**（能作源，不能作目标，原因见 `references/agent-storage.md` 对应变体 V6 / V7）：
   - `cursor`：composer 内部不变量 + 新代内容寻址 blob 链未文档化
   - `doubao`：侧栏 = 云端 + IndexedDB 缓存，本地 `.sessions` 不是会话注册表（外部写入不进列表，Q3 探针三处 oracle 全阴性）
+  - 附：`antigravity` 的独立 IDE / 备份根里是旧加密 `.pb`，读侧跳过；老 `.db` 内嵌 JSON 与新 `.db` protobuf 均可读。
 
 用户要求写入只读目标时：明确说明原因，并给出替代（写到某家可写目标，或只做反向同步）。
 

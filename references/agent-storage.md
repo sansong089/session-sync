@@ -97,7 +97,7 @@ SQLite 不强制列类型与长度，文档里出现的类型按以下语义理�
 | opencode | cli | 否 | cli→opencode | `opencode` 可执行 | `~/.local/share/opencode/`（全平台统一 XDG） | cli | 【真机】 |
 | claude | cli | 否 | cli→claude | `~/.claude/` | `~/.claude/`（桌面客户端是另一个消费端产品，不落此根） | cli | 【真机】 |
 | pi | cli | 否 | cli→pi | `~/.pi/` | `~/.pi/` | cli | 【真机】 |
-| antigravity | cli+ide-plugin+desktop | 待证 | cli→antigravity；ide-plugin / desktop→未接入 | `antigravity/Antigravity.exe`（桌面）、`Antigravity IDE/`（IDE）、`~/.gemini/antigravity-cli/`（CLI） | CLI 正文根 `~/.gemini/antigravity-cli/`；IDE 侧另有 `%APPDATA%/Antigravity/`；桌面与 IDE 的会话根未取证 | cli | 【真机】入口 ／【待证 待证-antigravity-1】 |
+| antigravity | cli+ide-plugin+desktop | 是 | cli/ide-plugin/desktop→antigravity（同一变体，按 role 分流） | `antigravity/Antigravity.exe`（桌面）、`Antigravity IDE/`（IDE，本机空目录）、`~/.gemini/antigravity-cli/`（CLI） | Hub `~/.gemini/antigravity/`（读写）、CLI `~/.gemini/antigravity-cli/`（读）、IDE `~/.gemini/antigravity-ide/`（旧 `.pb` 跳过）、备份 `~/.gemini/antigravity-backup/`（旧 `.pb` 跳过） | cli+desktop 读写；ide 正文不可读 | 【源码】paths.js 三常量 ／【真机】；原待证-antigravity-1 已结案 |
 | codex | cli+ide-plugin+desktop | 待证 | cli→codex；ide-plugin / desktop→未接入 | `~/.codex/`（CLI）；IDE 扩展与桌面入口为官方另发的入口形态 | CLI `~/.codex/`；扩展与桌面形态是否复用此根未取证 | cli | 【真机】CLI ／【待证 待证-codex-3】 |
 | codebuddy | cli+ide-plugin | 是 | cli→codebuddy；ide-plugin→codebuddy-ide | `~/.codebuddy/`（CLI）、`%LOCALAPPDATA%/CodeBuddyExtension/Data/`（IDE 插件） | 两套互不相同的根（CLI 项目目录 vs 扩展 Data） | 两者 | 【真机】 |
 | workbuddy | desktop | 否 | desktop→workbuddy-cn / workbuddy-intl（按版次分变体） | `WorkBuddy.exe`（中文版）、`WorkBuddyAI` 安装体（国际版） | 中文版 `~/.workbuddy/`；国际版 `~/.workbuddy-ai/` | desktop | 【真机】 |
@@ -737,13 +737,13 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 
 ## 5. antigravity — Antigravity
 
-> **存储模型**：每会话一个独立 SQLite 库，步骤与元数据分表；工作区归属记在会话级 history.jsonl 而不是会话库内。形态见「变体形态矩阵」。
+> **存储模型**：每会话一个独立 SQLite 库，步骤与元数据分表；CLI 的工作区归属记在会话级 history.jsonl，桌面 Hub 另有一份 `conversation_summaries.db` 作为侧栏列表源。三形态不同根，见「变体形态矩阵」与 V7。
 
 ### V1 数据根与定位
 
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
-| 默认根 | `<home>/.gemini/antigravity-cli/`，会话库在 `conversations/` 下 | 【真机】 |
+| 默认根 | CLI `<home>/.gemini/antigravity-cli/`；桌面 Hub `<home>/.gemini/antigravity/`（主读写，含 `conversation_summaries.db`）；独立 IDE `<home>/.gemini/antigravity-ide/` 与升级备份 `<home>/.gemini/antigravity-backup/`（仅旧加密 `.pb`）。`%APPDATA%/Antigravity/` 只是 Electron userData，无会话正文 | 【源码】paths.js 三常量 ／【真机】 |
 | 官方覆盖变量 | —（宿主无官方环境变量） | 【源码】 |
 | 目录归属判据 | 内含 `conversations/` 子目录（其下为 `<uuid>.db`） | 【真机】 |
 
@@ -804,10 +804,10 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
-| 正文格式 | SQLite；`steps.step_payload` / `metadata` / `task_details` 是 **protobuf 二进制**，内部嵌了可读 JSON | 【真机】 |
-| 编码与加密 | 可读 JSON 形态：`{"step_index":N,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>…"}` 与 `{"step_index":N,"source":"MODEL","type":"PLANNER_RESPONSE","content":…}` | 【真机】 |
+| 正文格式 | SQLite；`steps.step_payload` / `metadata` / `task_details` 是 **protobuf 二进制**。新库按 step_type 把正文放在不同子消息；早期版本在 protobuf 外壳里内嵌可读 JSON | 【真机】 |
+| 编码与加密 | 新库 protobuf：`step_payload` f1=step_type / f4=status / f5=metadata / f19=用户(f2=正文) / f20=助手(f1=正文,f3=thinking,f7=tool_call) / f140=工具输出；step_type 14=用户、15=助手、132/21=工具回执。老库内嵌 JSON：`{"step_index":N,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>…"}` 与 `{"step_index":N,"source":"MODEL","type":"PLANNER_RESPONSE","content":…}`。旧 `.pb` 加密不可读（熵 7.999，无 zstd/gzip/brotli 头，双副本仅约 0.4% 相同） | 【真机】 |
 | 压缩与多帧 | —（无） | 【真机】 |
-| 解码要点 | `gen_metadata` 同样是 protobuf 二进制，未展开 | 【真机】 |
+| 解码要点 | 时间戳在 metadata.f1（秒 + 100ns ticks）；`gen_metadata` 同为 protobuf，未展开；旧 `.pb` 仅 FTS 表有片段文本 | 【真机】 |
 
 ### V6 数据结构
 
@@ -857,29 +857,43 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
-| 列表来源 | `conversations/` 目录枚举 + `history.jsonl`，无独立索引库 | 【真机】 |
-| 打开正文依赖 | cwd 来自 `history.jsonl` 的 `workspace` 字段，不在会话 db 内 | 【真机】 |
-| 标题裁决 | —（无标题实体） | 【真机】 |
+| 列表来源 | CLI：`conversations/` 目录枚举 + `history.jsonl`；桌面 Hub：`conversation_summaries.db`（侧栏唯一列表源） | 【真机】 |
+| 打开正文依赖 | CLI cwd 来自 `history.jsonl` 的 `workspace`；Hub cwd 来自摘要库 `workspace_uris` 或会话库 `trajectory_metadata_blob` | 【真机】 |
+| 标题裁决 | Hub 摘要库 `title` 列；CLI 无标题实体 | 【真机】 |
 | 缺字段后果 | —（未见登记） | 【真机】 |
 
 ### V8 项目与工作区归属
 
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
-| 项目判定 | 只有 `history.jsonl` 的 `workspace`；无项目表 / 注册表 | 【真机】 |
-| 会话归属键 | —（会话 db 内不存归属字段；cwd 取自 `history.jsonl` 的 `workspace` 字段） | 【真机】 |
-| 项目注册表 | —（无项目表 / 关联键） | 【真机】 |
-| 非项目会话 | —（无） | 【真机】 |
+| 项目判定 | CLI 只有 `history.jsonl` 的 `workspace`；Hub 另有摘要库 `project_id` + `workspace_uris` | 【真机】 |
+| 会话归属键 | 会话 db 内不存归属字段；cwd 取自 `history.jsonl`（CLI）或 `workspace_uris`（Hub） | 【真机】 |
+| 项目注册表 | Hub 摘要库 `project_id`（如 `bab8d776-d38c-…`），无独立项目表 | 【真机】 |
+| 非项目会话 | `project_id = outside-of-project` / `workspace_uris = ''` | 【真机】 |
 | 项目显示名 | —（`app.asar` 主进程检索 rename / workspace 显示名零命中） | 【真机】 |
 
 ### V9 元数据与特殊会话
 
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
-| 时间戳 | 元数据在 `trajectory_meta` 与 `history.jsonl` | 【真机】 |
-| 多副本与去重 | —（未见多副本形态） | 【真机】 |
-| 子代理与特殊会话 | 未见子代理 / 分支的独立存放层；每会话一个 db 天然隔离 | 【真机】 |
-| 宿主迁移机制 | —（未见登记） | 【真机】 |
+| 时间戳 | 步骤 metadata.f1（秒 + 100ns ticks）；Hub 摘要库另有 `last_modified_time` / `last_user_input_time` | 【真机】 |
+| 多副本与去重 | 独立 IDE 与升级备份是同一批 12 个 `.pb` 的拷贝（同 ID、字节相同率仅 0.4%）；读侧按 `conversation_id` 跨根去重，Hub 优先 | 【真机】 |
+| 子代理与特殊会话 | `parent_conversation_id` / `nesting_depth`（摘要库）记录父子会话；每会话一个 db | 【真机】 |
+| 宿主迁移机制 | 桌面 Hub 的 IDE Wizard 会把 `antigravity/` 拷到 `antigravity-ide/` 与 `antigravity-backup/` | 【真机】日志 |
+
+### V10 桌面 Hub / IDE 形态（2026-11-20 补证）
+
+宿主 `app.asar` 的 `dist/paths.js` 自述三个根：`IDE_OLD_DATA_DIR=~/.gemini/antigravity`、`IDE_NEW_DATA_DIR=~/.gemini/antigravity-ide`、`IDE_BACKUP_DATA_DIR=~/.gemini/antigravity-backup`。命名错位：被标为「OLD IDE」的 `antigravity/` 现为桌面 Hub 活库，`antigravity-ide/` 才是独立 IDE 的根。
+
+| 规格项 | 内容 | 证据 |
+| --- | --- | --- |
+| Hub 会话库 | `~/.gemini/antigravity/conversations/<uuid>.db`，本机 16 个，2026-09-03 起的新格式（protobuf steps） | 【真机】 |
+| Hub 摘要库 | `~/.gemini/antigravity/conversation_summaries.db`：33 行 = 28 hub（16 `.db` + 12 `.pb`）+ 5 CLI；FTS 表 `conversations_fts` 覆盖 23 条 | 【真机】 |
+| 工作区 | 摘要 `workspace_uris` 如 `["file:///d%3A/00-lk-agent"]`；`trajectory_metadata_blob.f1` 也是 file URI | 【真机】 |
+| 独立 IDE | `~/.gemini/antigravity-ide/conversations/` 只有 12 个旧 `.pb`，根目录冻结在 2026-08-27 的 IDE Wizard 拷入时间 | 【真机】 |
+| 升级备份 | `~/.gemini/antigravity-backup/conversations/` 同为 12 个旧 `.pb`，与 IDE 侧同 ID | 【真机】 |
+| 加密结论 | 旧 `.pb` 每文件随机密钥加密（熵 7.999、双副本仅 0.4% 相同、±21 字节差），无 zstd/gzip/brotli 头，正文不可读；新 `.db` 未加密 | 【真机】 |
+| 写入落点 | 只写 Hub：正文库 + 摘要库双写；写 CLI 不会出现在 Hub 侧栏 | 【真机】 |
 
 ---
 

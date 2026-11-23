@@ -60,7 +60,7 @@ export function runSelftest() {
     const readers = ALL_VARIANTS.filter((v) => VARIANTS[v].read);
     const writers = ALL_VARIANTS.filter((v) => VARIANTS[v].write);
     if (readers.length !== 21) throw new Error(`readers=${readers.length}`);
-    if (writers.length !== 18) throw new Error(`writers=${writers.length}`);
+    if (writers.length !== 19) throw new Error(`writers=${writers.length}`);
     // 实际落地的 reader/writer 实现数（reader/writer 注册表）
     const implReaders = ALL_VARIANTS.filter((v) => READERS[v]).length;
     if (implReaders !== 21) throw new Error(`impl readers=${implReaders}`);
@@ -129,7 +129,7 @@ export function runSelftest() {
       if (!re.test(id)) throw new Error(`${variant}: bad id shape ${id}`);
     }
     // 只读集合（能作源不能作目标）；zcode/minimax 已按取证结论转为可写
-    const readonly = ['antigravity', 'cursor'];
+    const readonly = ['cursor', 'doubao'];
     for (const v of readonly) {
       if (VARIANTS[v].write !== false) throw new Error(`${v} must be unwritable`);
     }

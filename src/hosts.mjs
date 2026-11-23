@@ -336,7 +336,7 @@ export const LOCATOR = {
   opencode: { marker: { kind: 'sqlite-tables', rel: 'opencode.db', any: [['session_v2'], ['session', 'message', 'part']] }, probe: { parents: ['home', 'localAppData', 'appData'], names: ['opencode'], maxDepth: 5 }, root: (c) => rootOf(p(c.xdgData, 'opencode')), skills: { base: 'xdgConfig', rel: ['opencode', 'skill'] }, bucket: { shape: 'shared', root: (c) => c.home } },
   claude: { marker: { kind: 'children', any: [['projects']] }, probe: { parents: ['home', 'documents', 'localAppData', 'programFiles'], names: ['.claude'], maxDepth: 3 }, root: claudeRoot, skills: { base: 'root', rel: ['skills'] }, bucket: { shape: 'none' } },
   pi: { marker: { kind: 'children', any: [['agent', 'sessions']] }, probe: { parents: ['home', 'documents', 'localAppData', 'programFiles'], names: ['.pi'], maxDepth: 3 }, root: piRoot, skills: { base: 'root', rel: ['agent', 'skills'] }, bucket: { shape: 'none' } },
-  antigravity: { marker: { kind: 'children', any: [['conversations']] }, probe: { parents: ['home'], names: ['.gemini'], maxDepth: 2 }, root: (c) => rootOf(HOME(c, '.gemini', 'antigravity-cli')), skills: { base: 'root', rel: ['skills'] }, bucket: { shape: 'none' } },
+  antigravity: { marker: { kind: 'children', any: [['conversations']] }, probe: { parents: ['home'], names: ['.gemini'], maxDepth: 3 }, root: (c) => rootOf(HOME(c, '.gemini', 'antigravity')), skills: { base: 'root', rel: ['skills'] }, bucket: { shape: 'none' } },
   codex: { marker: { kind: 'children', any: [['sessions'], ['archived_sessions']] }, probe: { parents: ['home', 'documents', 'localAppData', 'appData', 'programFiles'], names: ['.codex'], maxDepth: 3 }, root: codexRoot, skills: null, bucket: { shape: 'generated', knownFolder: 'Codex', root: (c) => p(documents(c), 'Codex') }, account: [{ base: 'root', rel: ['auth.json'], note: '当前登录的唯一来源' }] },
   codebuddy: { marker: { kind: 'children', any: [['projects']] }, probe: { parents: ['home', 'documents', 'localAppData', 'appData', 'programFiles'], names: ['.codebuddy'], maxDepth: 3 }, root: codebuddyRoot, skills: { base: 'root', rel: ['skills'] }, bucket: { shape: 'none' }, account: [{ base: 'root', rel: ['inspiration'], kind: 'dir', note: '按 uid 分目录' }] },
   'codebuddy-ide': { marker: { kind: 'descendant-named', name: 'history', maxDepth: 4 }, probe: { parents: ['localAppData', 'appData', 'programFiles'], names: ['CodeBuddyExtension'], maxDepth: 5 }, root: codebuddyExtensionDataRoot, skills: null, bucket: { shape: 'none' } },
@@ -468,12 +468,26 @@ export const VARIANTS = {
     sharedDirect: true,
   },
 
+  /**
+   * Antigravity 一个变体跨四个落点，且入口名与目录名是错位的（宿主 paths.js 实证）：
+   *   ~/.gemini/antigravity        桌面 Hub 的活库（IDE_OLD_DATA_DIR），新 .db + 摘要库 —— 主读写根
+   *   ~/.gemini/antigravity-ide    独立安装的 IDE（IDE_NEW_DATA_DIR），只有旧加密 .pb —— 只读、跳过
+   *   ~/.gemini/antigravity-backup 升级时的备份（IDE_BACKUP_DATA_DIR），同 ID 的旧 .pb —— 只读、跳过
+   *   ~/.gemini/antigravity-cli    CLI 会话库，protobuf steps + history.jsonl —— 只读
+   * 写只落 Hub：那里有 conversation_summaries.db，宿主侧栏以它为准；写 CLI 不会出现在 Hub 列表里。
+   */
   antigravity: {
-    label: 'Antigravity CLI',
+    label: 'Antigravity',
     read: true,
-    write: false, // steps 为 protobuf 二进制，无安全写入路径
-    readPaths: (c) => [{ kind: 'dir', path: p(c.home, '.gemini', 'antigravity-cli', 'conversations'), role: 'sessions', envKey: null }],
-    detect: (c) => exists(VARIANTS.antigravity.readPaths(c)[0].path) || exists(p(c.home, '.gemini', 'antigravity-cli')),
+    write: 'B', // 一会话一 SQLite 库 + 侧栏摘要库，按 roleRoots 落 hub
+    readPaths: (c) => [
+      { kind: 'dir', path: p(c.home, '.gemini', 'antigravity', 'conversations'), role: 'hub', envKey: null, note: '桌面 Hub 会话库（主读写根）' },
+      { kind: 'dir', path: p(c.home, '.gemini', 'antigravity-cli', 'conversations'), role: 'sessions', envKey: null, note: 'CLI 会话库 + history.jsonl' },
+      { kind: 'dir', path: p(c.home, '.gemini', 'antigravity-ide', 'conversations'), role: 'ide', envKey: null, note: '独立 IDE（旧加密 .pb，跳过）' },
+      { kind: 'dir', path: p(c.home, '.gemini', 'antigravity-backup', 'conversations'), role: 'backup', envKey: null, note: '升级备份（同 ID 旧 .pb，跳过）' },
+    ],
+    auxPaths: (c) => [{ kind: 'file', path: p(c.home, '.gemini', 'antigravity', 'conversation_summaries.db'), note: 'Hub 侧栏摘要库（列表源）' }],
+    detect: (c) => VARIANTS.antigravity.readPaths(c).some((x) => exists(x.path)) || ['.gemini/antigravity', '.gemini/antigravity-cli', '.gemini/antigravity-ide'].some((r) => exists(p(c.home, ...r.split('/')))),
   },
 
   codex: {

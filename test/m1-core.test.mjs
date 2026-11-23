@@ -197,11 +197,12 @@ test('ir：finalize/preview/normalize', () => {
 test('hosts：21 变体登记与路径解析', () => {
   assert.equal(ALL_VARIANTS.length, 21);
   assert.equal(ALL_VARIANTS.filter((v) => VARIANTS[v].read).length, 21);
-  // 架构上可写 18 家；antigravity/cursor/doubao 只读（原因见 hosts.mjs 注释）
-  assert.equal(ALL_VARIANTS.filter((v) => VARIANTS[v].write).length, 18);
-  for (const ro of ['antigravity', 'cursor', 'doubao']) {
+  // 架构上可写 19 家；cursor/doubao 只读（原因见 hosts.mjs 注释）
+  assert.equal(ALL_VARIANTS.filter((v) => VARIANTS[v].write).length, 19);
+  for (const ro of ['cursor', 'doubao']) {
     assert.equal(VARIANTS[ro].write, false, ro);
   }
+  assert.equal(VARIANTS.antigravity.write, 'B', 'antigravity 已接 Hub 库 + 侧栏摘要库双写');
   // qoder×2 本轮转可写：正文 jsonl 明文 + 桌面注册表 main.sqlite 明文（2026-10-28 真机取证）
   for (const q of ['qoder-cn', 'qoder-intl']) {
     assert.equal(VARIANTS[q].write, 'B', q);

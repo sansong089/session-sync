@@ -19,6 +19,9 @@ import { roleRoots, resolveRoot, parseDataRoots, invalidateRoots, writeGate } fr
 const ROLE_KINDS = {
   projects: ['dir'],
   sessions: ['dir'],
+  hub: ['dir'],
+  ide: ['dir'],
+  backup: ['dir'],
   tasks: ['dir'],
   history: ['dir'],
   data: ['dir'],

@@ -13,6 +13,7 @@ import { dshWriter } from './dsh.mjs';
 import { zcodeWriter } from './zcode.mjs';
 import { minimaxWriter } from './minimax.mjs';
 import { createQoderWriter } from './qoder.mjs';
+import { antigravityWriter } from './antigravity.mjs';
 import { isFile, isDir } from '../util.mjs';
 import { roleRoots } from '../roots.mjs';
 import { configRoot } from '../hosts.mjs';
@@ -92,6 +93,7 @@ export const WRITERS = {
   zcode: zcodeWriter,
   minimax: minimaxWriter,
   dsh: dshWriter,
+  antigravity: antigravityWriter,
 };
 
 // 写侧唯一入口：各家降级附件的格式不同，但「附件排在本轮用户消息之前」对它们是同一个坑

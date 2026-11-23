@@ -104,7 +104,7 @@ node bin/session-sync.mjs import --from codex --since 7d --apply
 | cline | VS Code 扩展 + CLI | ✅ | ✅ |
 | kilo | VS Code 扩展 | ✅ | ✅ |
 | roo | VS Code 插件 | ✅ | ✅ |
-| antigravity | IDE | ✅ | ❌ |
+| antigravity | CLI / IDE / 桌面 | ✅ | ✅ |
 | cursor | IDE | ✅ | ❌ |
 | doubao | 桌面（agent 模式） | ✅ | ❌ |
 
@@ -170,7 +170,7 @@ session-sync switch-account --into codebuddy-ide --id <会话id> --account <目�
 npm test
 ```
 
-测试覆盖 420 条用例，包含 17 个可写目标全矩阵回归（第 18 个可写目标 claude 的自导入单独覆盖），并对真实宿主存储做只读核对；真机脚本另有两支可复跑：`test/real-host/codebuddy.mjs`（用官方 CLI 的未登录加载提示做 oracle）与 `test/real-host/codebuddy-ide.mjs`（镜像真实扩展缓存跑真 `switch-account`，验证跨账号搬迁与补项目）。
+测试覆盖 420 条用例，包含 18 个可写目标全矩阵回归（第 19 个可写目标 claude 的自导入单独覆盖），并对真实宿主存储做只读核对；真机脚本另有两支可复跑：`test/real-host/codebuddy.mjs`（用官方 CLI 的未登录加载提示做 oracle）与 `test/real-host/codebuddy-ide.mjs`（镜像真实扩展缓存跑真 `switch-account`，验证跨账号搬迁与补项目）。
 
 **功能性修改的硬规矩（改前必读规格）**：涉及存储的改动（reader / writer / roots / hosts / title-slots / identity / placement / accounts）动手前先读 [`references/agent-storage.md`](references/agent-storage.md) 对应变体的 V1–V9，落地后同步更新规格项与验证状态；本程序机制变更同步 [`references/program-spec.md`](references/program-spec.md)。无真机/源码证据的规格项只能标【待证】并登记清单，修改涉及待证项前先取证或经项目主人确认。`test/m74` 棘轮守护这些规则。
 

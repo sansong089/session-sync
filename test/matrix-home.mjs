@@ -167,6 +167,25 @@ export function setupHome({ padChars = 0, middleTurns = 0 } = {}) {
   fs.mkdirSync(path.join(appData, 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev', 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(appData, 'Code', 'User', 'globalStorage', 'kilocode.kilo-code', 'tasks'), { recursive: true });
 
+  // antigravity：写侧落在桌面 Hub（每会话一库 + 侧栏摘要库），不是 CLI 根
+  const agHub = path.join(home, '.gemini', 'antigravity');
+  fs.mkdirSync(path.join(agHub, 'conversations'), { recursive: true });
+  const agSum = new DatabaseSync(path.join(agHub, 'conversation_summaries.db'));
+  agSum.exec(`CREATE TABLE conversation_summaries (
+    conversation_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT "", preview TEXT NOT NULL DEFAULT "",
+    step_count INTEGER NOT NULL DEFAULT 0, last_modified_time datetime NOT NULL, workspace_uris TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT "", source TEXT NOT NULL DEFAULT "", project_id TEXT NOT NULL DEFAULT "",
+    agent_name TEXT NOT NULL DEFAULT "", parent_conversation_id TEXT NOT NULL DEFAULT "", nesting_depth INTEGER NOT NULL DEFAULT 0,
+    battle_id TEXT NOT NULL DEFAULT "", winning_conversation_id TEXT NOT NULL DEFAULT "", not_fully_idle numeric NOT NULL DEFAULT false,
+    killed numeric NOT NULL DEFAULT false, last_user_input_time datetime NOT NULL, last_user_input_step_index INTEGER NOT NULL DEFAULT -1,
+    app_data_dir TEXT NOT NULL DEFAULT "", raw_summary blob, group_id TEXT NOT NULL DEFAULT "")`);
+  agSum.exec(`CREATE VIRTUAL TABLE conversations_fts USING fts5(
+    conversation_id UNINDEXED, chunk_index UNINDEXED, chunk_first_step UNINDEXED, chunk_last_step UNINDEXED,
+    last_modified_time UNINDEXED, step_count UNINDEXED, last_step_created_at UNINDEXED, archived UNINDEXED,
+    user_step_byte_offsets UNINDEXED, agent_step_byte_offsets UNINDEXED,
+    title, workspace, project, user_body, agent_body, tokenize = 'unicode61 remove_diacritics 2')`);
+  agSum.close();
+
   const ctx = makeCtx({ home, platform: 'win32', appData, env });
   // env 档只盖住了带专用变量的目标；pi / workbuddy / freebuff / cline 族 / claude 这些
   // 走默认根的目标也要垫出配置根，否则全矩阵会被写门按「宿主从没出现过」拦下

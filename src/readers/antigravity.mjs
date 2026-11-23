@@ -1,57 +1,109 @@
-// readers/antigravity.mjs — Antigravity CLI
+// readers/antigravity.mjs — Antigravity（桌面 Hub / IDE / CLI 共用一个变体）
 //
-// 存储：~/.gemini/antigravity-cli/conversations/<conversationId>.db
-//   每个 db = 一个会话；表 trajectory_meta / steps / gen_metadata / executor_metadata
-//   / parent_references / trajectory_metadata_blob / battle_mode_infos
-// steps.step_payload / metadata / task_details 是 protobuf 二进制（BLOB），
-// 但内部嵌了完整可读 JSON：
-//   {"step_index":N,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>…"}
-//   {"step_index":N,"source":"MODEL","type":"PLANNER_RESPONSE","content":"…","thinking":"…","tool_calls":[…]}
-// 因此按「字节流里扫配平 JSON 对象」提取正文，质量接近正常读取。
-// cwd 取自同目录 history.jsonl 的 workspace（按 conversationId 关联）。
+// 一个变体跨四个落点（详见 hosts.mjs 的 VARIANTS.antigravity 注释）：
+//   ~/.gemini/antigravity          桌面 Hub 活库：每会话一个 SQLite + conversation_summaries.db
+//   ~/.gemini/antigravity-cli      CLI 会话库：同样的 steps 表 + history.jsonl
+//   ~/.gemini/antigravity-ide      独立 IDE：只有旧加密 .pb，正文不可读
+//   ~/.gemini/antigravity-backup   升级备份：同 ID 的旧 .pb，正文不可读
+//
+// 正文形态两代：
+//   新 .db  —— steps.step_payload 是 protobuf，正文/思考/工具调用按 step_type 落在不同子消息；
+//              由 antigravity-proto.mjs 解码（读写共用同一份 schema 取证）。
+//   旧内嵌 JSON —— 早期版本把 USER_INPUT / PLANNER_RESPONSE 塞在 protobuf 外壳里，保留兜底。
+//   旧 .pb   —— 每文件随机密钥加密（熵 7.999、双副本仅 0.4% 相同），无密钥不可读，直接跳过。
+//
 // provenance 槽位：sidecar（db 为二进制，无法内嵌）
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { roleRoots } from '../roots.mjs';
-import {
-  makeSession,
-  messageItem,
-  reasoningItem,
-  toolCallItem,
-  noteItem,
-  finalizeSession,
-} from '../ir.mjs';
+import { makeSession, messageItem, reasoningItem, toolCallItem, toolResultItem, noteItem, finalizeSession } from '../ir.mjs';
 import { applyProvenanceToIR, readSidecarProvenance } from '../provenance.mjs';
-import { firstExisting } from './base.mjs';
-import { assembleTurns, deriveTitle, stripSystemInjections, walkFiles, toMs, fileMtime, tableExists, inTimeRange,
-  parseArgs, pushAssistantItem } from './base.mjs';
+import {
+  assembleTurns, deriveTitle, stripSystemInjections, walkFiles, toMs, fileMtime, tableExists, inTimeRange,
+  parseArgs, pushAssistantItem,
+} from './base.mjs';
+import { decodeStepRow, decodeWorkspaceBlob, uriToPath, toBuf } from './antigravity-proto.mjs';
 import { previewTitle } from '../titles.mjs';
 
-function conversationsDir(ctx) {
-  return firstExisting(roleRoots('antigravity', ctx, 'sessions'))?.path ?? null;
-}
+// 优先级：Hub 是活库且带摘要表；CLI 次之；IDE/备份只有加密 .pb（这里仍扫一遍以便按 ID 去重时保持顺序）
+const ROLE_PRIORITY = { hub: 0, sessions: 1, ide: 2, backup: 3 };
 
-// sqlite 返回 BLOB 可能是 Buffer / Uint8Array / 数字键对象（旧库也可能是文本）
-function toBuf(v) {
-  if (v == null) return null;
-  if (Buffer.isBuffer(v)) return v;
-  if (v instanceof Uint8Array) return Buffer.from(v);
-  if (typeof v === 'string') return Buffer.from(v, 'binary');
-  if (typeof v === 'object') {
-    const keys = Object.keys(v)
-      .map(Number)
-      .filter((n) => Number.isInteger(n) && n >= 0)
-      .sort((a, b) => a - b);
-    if (!keys.length) return null;
-    const b = Buffer.alloc(keys[keys.length - 1] + 1);
-    for (const k of keys) b[k] = Number(v[k]) & 0xff;
-    return b;
+/** 逐 role 取根（不放进循环变量：role 必须有显式消费者，见 test/m77-role-declaration） */
+function rootsForRole(ctx, role) {
+  switch (role) {
+    case 'hub':
+      return roleRoots('antigravity', ctx, 'hub');
+    case 'sessions':
+      return roleRoots('antigravity', ctx, 'sessions');
+    case 'ide':
+      return roleRoots('antigravity', ctx, 'ide');
+    case 'backup':
+      return roleRoots('antigravity', ctx, 'backup');
+    default:
+      return [];
   }
-  return null;
 }
 
-// 在字节流里扫描配平的 JSON 对象（跳过字符串内的括号）
+/** 四个根下的 conversations 目录（去重，按优先级排） */
+export function conversationDirs(ctx) {
+  const out = [];
+  for (const role of ['hub', 'sessions', 'ide', 'backup']) {
+    for (const r of rootsForRole(ctx, role)) {
+      if (r.kind !== 'dir' || !r.path) continue;
+      if (!out.some((x) => x.path === r.path)) out.push({ role, path: r.path });
+    }
+  }
+  return out;
+}
+
+/** 侧栏摘要库：唯一出口是 aux role（与 writer 共用） */
+function summariesDbOf(ctx) {
+  const f = roleRoots('antigravity', ctx, 'aux').find((r) => r.kind === 'file')?.path ?? null;
+  return f && fs.existsSync(f) ? f : null;
+}
+
+function readSummaries(ctx) {
+  const map = new Map();
+  const file = summariesDbOf(ctx);
+  if (!file) return map;
+  let db;
+  try {
+    db = new DatabaseSync(file, { readOnly: true });
+  } catch {
+    return map;
+  }
+  try {
+    if (!tableExists(db, 'conversation_summaries')) return map;
+    for (const r of db.prepare('SELECT * FROM conversation_summaries').all()) {
+      map.set(String(r.conversation_id), r);
+    }
+  } catch {
+    /* 老库无此表 */
+  } finally {
+    try {
+      db.close();
+    } catch { /* ignore */ }
+  }
+  return map;
+}
+
+function parseHostTime(v) {
+  const s = String(v ?? '');
+  if (!s || s.startsWith('0001-')) return 0;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? 0 : t;
+}
+
+function urisToPath(uris) {
+  for (const u of uris || []) {
+    const p = uriToPath(u);
+    if (p) return p;
+  }
+  return '';
+}
+
+// 在字节流里扫描配平的 JSON 对象（跳过字符串内的括号）—— 老形态兜底
 export function extractJsonBlobs(buf) {
   const out = [];
   const s = buf.toString('utf8');
@@ -79,9 +131,7 @@ export function extractJsonBlobs(buf) {
               out.push(o);
               i = j;
             }
-          } catch {
-            /* 不是完整 JSON，继续向后 */
-          }
+          } catch { /* 不是完整 JSON，继续向后 */ }
           break;
         }
       }
@@ -90,7 +140,7 @@ export function extractJsonBlobs(buf) {
   return out;
 }
 
-// 会话目录下的 history.jsonl：conversationId → {workspace, prompts[]}
+// 会话目录下的 history.jsonl：conversationId → {workspace, prompts[]}（CLI 形态）
 function readHistory(baseDir) {
   const map = new Map();
   const file = path.join(baseDir, 'history.jsonl');
@@ -120,22 +170,40 @@ function readHistory(baseDir) {
   return map;
 }
 
-function listDbs(dir) {
-  if (!dir) return [];
-  return walkFiles(dir, { maxDepth: 1, match: (n) => n.endsWith('.db') && !n.includes('.session-sync.') });
+/** 全部会话文件（.db），按 ID 去重；.pb 是密文，直接跳过 */
+export function findConversationFiles(ctx) {
+  const byId = new Map();
+  for (const dir of conversationDirs(ctx)) {
+    if (!fs.existsSync(dir.path)) continue;
+    for (const file of walkFiles(dir.path, { maxDepth: 1, match: (n) => n.endsWith('.db') && !n.includes('.session-sync.') })) {
+      const id = path.basename(file, '.db');
+      const prev = byId.get(id);
+      const mtime = fileMtime(file);
+      if (prev && (prev.priority < ROLE_PRIORITY[dir.role] || (prev.priority === ROLE_PRIORITY[dir.role] && prev.mtime >= mtime))) continue;
+      byId.set(id, { id, file, role: dir.role, priority: ROLE_PRIORITY[dir.role], mtime });
+    }
+  }
+  return [...byId.values()].sort((a, b) => b.mtime - a.mtime);
 }
 
-// 读取一个会话 db → {steps:[{idx, blobs[]}], trajectory}
+/** 读取一个会话 db → protobuf 步骤 + 老 JSON blobs + 工作区 URI */
 function readDb(file) {
   const db = new DatabaseSync(file, { readOnly: true });
   try {
-    const out = { steps: [], trajectory: null };
+    const out = { steps: [], trajectory: null, workspaceUris: [] };
     if (tableExists(db, 'trajectory_meta')) {
       out.trajectory = db.prepare('SELECT * FROM trajectory_meta LIMIT 1').get() ?? null;
+    }
+    if (tableExists(db, 'trajectory_metadata_blob')) {
+      try {
+        const row = db.prepare("SELECT data FROM trajectory_metadata_blob WHERE id='main'").get();
+        if (row) out.workspaceUris = decodeWorkspaceBlob(row.data);
+      } catch { /* 老库无此表 */ }
     }
     if (!tableExists(db, 'steps')) return out;
     const rows = db.prepare('SELECT * FROM steps ORDER BY idx').all();
     for (const row of rows) {
+      const decoded = decodeStepRow(row);
       const blobs = [];
       const seen = new Set();
       for (const col of ['step_payload', 'metadata', 'task_details']) {
@@ -148,7 +216,7 @@ function readDb(file) {
           blobs.push(o);
         }
       }
-      out.steps.push({ idx: Number(row.idx) || 0, type: Number(row.step_type) || 0, blobs });
+      if (decoded || blobs.length) out.steps.push({ idx: Number(row.idx) || 0, type: Number(row.step_type) || 0, decoded, blobs });
     }
     return out;
   } finally {
@@ -169,16 +237,38 @@ function cleanUserInput(content) {
 function isUserInput(o) {
   return o && (o.type === 'USER_INPUT' || (o.source === 'USER_EXPLICIT' && typeof o.content === 'string'));
 }
-
 function isPlannerResponse(o) {
   return o && (o.type === 'PLANNER_RESPONSE' || (o.source === 'MODEL' && typeof o.content === 'string'));
 }
 
-function buildEntries(parsed) {
+/** protobuf 步骤 → entries */
+function buildProtoEntries(parsed) {
   const entries = [];
-  const pushItem = (item, ts) => pushAssistantItem(entries, item, ts);
+  const push = (item, ts) => pushAssistantItem(entries, item, ts);
+  for (const step of parsed.steps) {
+    const d = step.decoded;
+    if (!d) continue;
+    if (d.role === 'user') {
+      const text = cleanUserInput(d.content);
+      if (text) entries.push({ role: 'user', ts: d.ts, items: [messageItem('user', text, d.ts)] });
+    } else if (d.role === 'assistant') {
+      const items = [];
+      if (d.thinking) items.push(reasoningItem(d.thinking, d.ts));
+      if (d.content) items.push(messageItem('assistant', d.content, d.ts));
+      for (const tc of d.toolCalls) items.push(toolCallItem(tc.id, tc.name, tc.input, d.ts));
+      for (const item of items) push(item, d.ts);
+    } else if (d.toolCalls.length) {
+      const tc = d.toolCalls[0];
+      push(toolResultItem(tc.id, tc.name, 'ok', d.output || null, d.ts), d.ts);
+    }
+  }
+  return entries;
+}
 
-  // step_index 决定顺序；同一 step 内 USER_INPUT 先于 PLANNER_RESPONSE
+/** 老内嵌 JSON 步骤 → entries（保留旧库可读） */
+function buildJsonEntries(parsed) {
+  const entries = [];
+  const push = (item, ts) => pushAssistantItem(entries, item, ts);
   const events = [];
   for (const step of parsed.steps) {
     for (const o of step.blobs) {
@@ -186,7 +276,6 @@ function buildEntries(parsed) {
     }
   }
   events.sort((a, b) => a.step - b.step || a.order - b.order);
-
   for (const { o } of events) {
     const ts = toMs(o.created_at);
     if (isUserInput(o)) {
@@ -194,7 +283,6 @@ function buildEntries(parsed) {
       if (text) entries.push({ role: 'user', ts, items: [messageItem('user', text, ts)] });
       continue;
     }
-    // PLANNER_RESPONSE
     const items = [];
     if (o.thinking) items.push(reasoningItem(o.thinking, ts));
     const text = String(o.content ?? '').trim();
@@ -203,15 +291,20 @@ function buildEntries(parsed) {
       const input = call?.args ?? parseArgs(call?.argumentsJson ?? call?.arguments);
       items.push(toolCallItem(call?.id ?? null, call?.name ?? 'tool', input, ts));
     }
-    if (items.length) entries.push({ role: 'assistant', ts, items });
+    for (const item of items) push(item, ts);
   }
   return entries;
 }
 
-function summarize(parsed, historyEntry) {
+function buildEntries(parsed) {
+  const proto = buildProtoEntries(parsed);
+  return proto.length ? proto : buildJsonEntries(parsed);
+}
+
+function summarize(parsed, { summary = null, historyEntry = null, file = '' } = {}) {
   let createdAt = 0;
   let updatedAt = 0;
-  let cwd = historyEntry?.workspace ?? '';
+  let cwd = '';
   let preview = '';
   let userMsgs = 0;
   let model = null;
@@ -227,96 +320,122 @@ function summarize(parsed, historyEntry) {
         if (typeof c === 'string' && c) cwd = c;
       }
       if (typeof o.model === 'string' && !model) model = o.model;
-      if (isUserInput(o)) {
-        const t = cleanUserInput(o.content);
-        if (t) {
-          userMsgs++;
-          if (!preview) preview = t;
-        }
+    }
+    const d = step.decoded;
+    if (d?.ts) {
+      if (!createdAt || d.ts < createdAt) createdAt = d.ts;
+      if (d.ts > updatedAt) updatedAt = d.ts;
+    }
+    if (d?.role === 'user') {
+      const t = cleanUserInput(d.content);
+      if (t) {
+        userMsgs++;
+        if (!preview) preview = t;
       }
     }
   }
+  const summaryTime = parseHostTime(summary?.last_modified_time);
+  if (summaryTime) updatedAt = Math.max(updatedAt, summaryTime);
+  const userTime = parseHostTime(summary?.last_user_input_time);
+  if (userTime) createdAt = createdAt || userTime;
+  if (!preview) preview = String(summary?.title || summary?.preview || '');
   if (!preview && historyEntry?.prompts?.length) preview = historyEntry.prompts[0].text;
-  if (!userMsgs) userMsgs = historyEntry?.prompts?.length ?? 0;
+  if (!cwd) cwd = urisToPath(parsed.workspaceUris);
+  if (!cwd && summary?.workspace_uris) {
+    try {
+      cwd = urisToPath(JSON.parse(String(summary.workspace_uris)));
+    } catch { /* ignore */ }
+  }
+  if (!cwd) cwd = historyEntry?.workspace ?? '';
+  if (!userMsgs) userMsgs = Number(summary?.step_count) || historyEntry?.prompts?.length || 0;
   return { createdAt, updatedAt, cwd, preview, userMsgs, model };
 }
 
 export const antigravityReader = {
   variant: 'antigravity',
-  label: 'Antigravity CLI',
+  label: 'Antigravity',
 
   available(ctx) {
-    const d = conversationsDir(ctx);
-    return !!d && fs.existsSync(d);
+    return conversationDirs(ctx).some((d) => fs.existsSync(d.path));
   },
 
   list(ctx, opts = {}) {
-    const dir = conversationsDir(ctx);
-    const history = readHistory(path.dirname(dir ?? ''));
+    const summaries = readSummaries(ctx);
+    const historyByDir = new Map();
     const out = [];
-    for (const file of listDbs(dir)) {
-      const id = path.basename(file, '.db');
+    for (const found of findConversationFiles(ctx)) {
       let parsed;
       try {
-        parsed = readDb(file);
+        parsed = readDb(found.file);
       } catch {
         continue;
       }
-      const h = history.get(id);
-      const s = summarize(parsed, h);
+      if (!parsed.steps.length) continue;
+      if (!historyByDir.has(found.role)) {
+        historyByDir.set(found.role, readHistory(path.dirname(conversationDirs(ctx).find((d) => d.role === found.role)?.path ?? found.file)));
+      }
+      const historyEntry = historyByDir.get(found.role).get(found.id);
+      const s = summarize(parsed, { summary: summaries.get(found.id), historyEntry, file: found.file });
+      const hasProto = parsed.steps.some((x) => x.decoded?.role === 'user' || x.decoded?.role === 'assistant');
       out.push({
-        id,
+        id: found.id,
         variant: 'antigravity',
-        title: previewTitle(s.preview) || 'untitled',
+        title: String(summaries.get(found.id)?.title || '').trim() || previewTitle(s.preview) || 'untitled',
         preview: s.preview.replace(/\s+/g, ' ').slice(0, 120),
         cwd: s.cwd,
-        createdAt: s.createdAt || fileMtime(file),
-        updatedAt: s.updatedAt || fileMtime(file),
+        createdAt: s.createdAt || fileMtime(found.file),
+        updatedAt: s.updatedAt || fileMtime(found.file),
         turns: s.userMsgs,
         turnsApprox: false,
         model: s.model,
         steps: parsed.steps.length,
-        readQuality: 'embedded-json',
-        provenance: readSidecarProvenance(file),
-        sourcePath: file,
+        readQuality: hasProto ? 'protobuf' : 'embedded-json',
+        provenance: readSidecarProvenance(found.file),
+        sourcePath: found.file,
       });
     }
     return out.filter((s) => inTimeRange(s, opts));
   },
 
   read(ctx, id) {
-    const dir = conversationsDir(ctx);
-    const file = path.join(dir, `${id}.db`);
-    if (!fs.existsSync(file)) return null;
-    const parsed = readDb(file);
-    const history = readHistory(path.dirname(dir));
-    const h = history.get(String(id));
-    const s = summarize(parsed, h);
-
+    const found = findConversationFiles(ctx).find((x) => x.id === String(id));
+    if (!found) return null;
+    const parsed = readDb(found.file);
+    const summary = readSummaries(ctx).get(String(id)) ?? null;
+    let historyEntry = null;
+    for (const dir of conversationDirs(ctx)) {
+      const h = readHistory(path.dirname(dir.path));
+      if (h.has(String(id))) {
+        historyEntry = h.get(String(id));
+        break;
+      }
+    }
+    const s = summarize(parsed, { summary, historyEntry, file: found.file });
     const turns = assembleTurns(buildEntries(parsed));
     if (turns.length === 0) {
-      // 完全无可解内容：保留一条说明，避免产生"空会话"误导
-      turns.push({ index: 0, role: 'system', items: [noteItem('antigravity: 该会话的 steps 中未提取到可读正文')] });
+      turns.push({ index: 0, role: 'system', items: [noteItem('antigravity: 该会话的 steps 中未提取到可读正文（旧 .pb 为加密格式）')] });
     }
-
+    const hasProto = parsed.steps.some((x) => x.decoded?.role === 'user' || x.decoded?.role === 'assistant');
     const session = makeSession({
       id: String(id),
       variant: 'antigravity',
-      title: deriveTitle(s.preview, turns),
+      title: String(summary?.title || '').trim() || deriveTitle(s.preview, turns),
       cwd: s.cwd,
-      createdAt: s.createdAt || fileMtime(file),
-      updatedAt: s.updatedAt || fileMtime(file),
+      createdAt: s.createdAt || fileMtime(found.file),
+      updatedAt: s.updatedAt || fileMtime(found.file),
       model: s.model,
       turns,
       meta: {
-        sourcePath: file,
-        readQuality: 'embedded-json',
+        sourcePath: found.file,
+        readQuality: hasProto ? 'protobuf' : 'embedded-json',
         trajectory: parsed.trajectory ?? null,
         steps: parsed.steps.length,
-        historyPrompts: h?.prompts?.length ?? 0,
+        workspaceUris: parsed.workspaceUris,
+        projectId: String(summary?.project_id || ''),
+        historyPrompts: historyEntry?.prompts?.length ?? 0,
       },
     });
-    applyProvenanceToIR(session, readSidecarProvenance(file));
+    applyProvenanceToIR(session, readSidecarProvenance(found.file));
     return finalizeSession(session);
   },
 };

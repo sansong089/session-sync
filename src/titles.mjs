@@ -34,6 +34,7 @@ export const TITLE_MAX = Object.freeze({
   pi: 500,
   freebuff: 500,
   'codebuddy-ide': 200,
+  antigravity: 500,
   cline: 200,
   kilo: 200,
   roo: 200,

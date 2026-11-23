@@ -12,3 +12,4 @@ node_modules/
 # 本机安装产物与个人工作日志（不入库：含绝对路径与日记内容）
 .agents/
 .workbuddy/
+.qoder/

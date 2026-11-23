@@ -171,11 +171,11 @@ test('kilo（任务目录）：create + 校验', () => {
   assert.match(r.targetId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
 });
 
-test('只读目标被拒绝：cursor / antigravity', () => {
+test('只读目标被拒绝：cursor / doubao', () => {
   const home = tmpHome('readonly');
   makeClaudeSource(home);
   const ctx = ctxFor(home);
-  for (const target of ['cursor', 'antigravity']) {
+  for (const target of ['cursor', 'doubao']) {
     const plan = planImport(ctx, { from: ['claude'], into: [target] });
     const results = executePlan(ctx, plan, { apply: true });
     assert.equal(results[0].ok, false, target);

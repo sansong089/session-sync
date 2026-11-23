@@ -13,7 +13,7 @@ import { SRC_ID, setupHome } from './matrix-home.mjs';
 // 并行测试文件互抢同一个 target:<变体> 锁 key 会造成偶发假失败：本进程用独立锁目录
 process.env.SESSION_SYNC_LOCK_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-locks-'));
 
-test('可写目标全矩阵：17 个目标逐个导入 + 校验 + round-trip 收敛', () => {
+test('可写目标全矩阵：18 个目标逐个导入 + 校验 + round-trip 收敛', () => {
   const { ctx } = setupHome();
   // 源就是 claude，claude → claude 属自导（应为 skip），单独断言；其余目标逐一验证
   const selfPlan = planImport(ctx, { allowFamilyDuplicate: true, from: ['claude'], into: ['claude'] });
@@ -21,8 +21,8 @@ test('可写目标全矩阵：17 个目标逐个导入 + 校验 + round-trip 收
   assert.equal(selfPlan.pairs[0].targetId, SRC_ID);
 
   const targets = WRITABLE_VARIANTS.filter((v) => v !== 'claude').sort();
-  assert.equal(WRITABLE_VARIANTS.length, 18, `可写目标应为 18 个，实际 ${WRITABLE_VARIANTS.length}`);
-  assert.equal(targets.length, 17);
+  assert.equal(WRITABLE_VARIANTS.length, 19, `可写目标应为 19 个，实际 ${WRITABLE_VARIANTS.length}`);
+  assert.equal(targets.length, 18);
 
   const srcSession = readSession('claude', ctx, SRC_ID).session;
   const want = sessionCoreFingerprints(srcSession);

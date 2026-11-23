@@ -412,9 +412,9 @@ WorkBuddy 的 `transport`/`unread`/`thought_level` 就不在 baseline 里 ——
 
 | 产品 | 形态 | role | 根 | 读 | 写 | 备注 |
 | --- | --- | --- | --- | --- | --- | --- |
-| antigravity | cli | sessions | `~/.gemini/antigravity-cli/` | ✅ | ✅ | 唯一的已接入形态 |
-| antigravity | ide-plugin | 未声明 | `%APPDATA%/Antigravity/` | ❌ | ❌ | 会话根未取证（待证-antigravity-1） |
-| antigravity | desktop | 未声明 | 未取证 | ❌ | ❌ | 同上 |
+| antigravity | cli | sessions | `~/.gemini/antigravity-cli/` | ✅ | ❌ | CLI 正文库可读；侧栏由 Hub 摘要库决定，写 CLI 不会出现在 Hub |
+| antigravity | ide-plugin | ide | `~/.gemini/antigravity-ide/` | ✅ | ❌ | 仅旧加密 `.pb`（读侧跳过）；独立 IDE 安装目录为空 |
+| antigravity | desktop | hub | `~/.gemini/antigravity/` | ✅ | ✅ | Hub 活库：`conversations/<id>.db` + `conversation_summaries.db` 双写 |
 | codex | cli | sessions | `~/.codex/` | ✅ | ✅ | 归档目录用 `archive` role、只读不写（不进导入候选）；判定不再靠目录名 |
 | codex | ide-plugin | 未声明 | 未取证 | ❌ | ❌ | 是否复用 `~/.codex/` 待证（待证-codex-3） |
 | codex | desktop | 未声明 | 未取证 | ❌ | ❌ | 官方已并入 ChatGPT 桌面端 |
@@ -427,7 +427,7 @@ WorkBuddy 的 `transport`/`unread`/`thought_level` 就不在 baseline 里 ——
 | kilo | ide-plugin | tasks | `<IDE>/User/globalStorage/kilocode.kilo-code/tasks/` | ✅ | 条件 | 写侧按 `kilo.db` 是否存在分派 |
 | kilo | cli | db | `~/.kilo/kilo.db` | ✅ | 条件 | 同上：有库写库，无库写任务目录 |
 
-**role 覆盖**：21 个变体已全部声明 role（原先只有 6 个）。仍标「未声明」的行是**该形态尚未接入**（antigravity 的 IDE/桌面、codex 的扩展/桌面），不是漏标。
+**role 覆盖**：21 个变体已全部声明 role（原先只有 6 个）。仍标「未声明」的行是**该形态尚未接入**（codex 的扩展/桌面），不是漏标；antigravity 三形态已分别声明 sessions / ide / hub。
 
 **已知的写覆盖缺口**：cline 的 IDE 插件形态读得到、写不到（写侧落点固定为 CLI 三代会话库）。
 用户若在 IDE 形态下工作，导入后侧栏看不到结果——这不是 bug，是尚未接入；按 §4.1 的策略如实告知，不要假装成功。
@@ -455,6 +455,9 @@ kilo 同时存在 `kilo.db` 与 `~/.kilo/tasks` 时，门会指向 `tasks`、实
 | --- | --- | --- | --- | --- |
 | projects | dir | many | 项目分目录正文 | claude / codebuddy / workbuddy-cn / workbuddy-intl / freebuff 读写 |
 | sessions | dir | many | 会话 ID 分目录正文 | cline / pi / dsh / antigravity / cursor / codex / doubao 读 |
+| hub | dir | one | 桌面 Hub 活库（每会话一 SQLite + 侧栏摘要库） | antigravity 读写 |
+| ide | dir | one | 独立安装的 IDE 数据根（旧加密 .pb，正文跳过） | antigravity 读 |
+| backup | dir | one | 升级备份（与 IDE 同 ID 的旧 .pb，正文跳过） | antigravity 读 |
 | tasks | dir | many | Cline 血统任务三件套 | cline / kilo / roo 读写 |
 | sessionsIndex | file | one | 会话列表索引库 | cline / workbuddy-cn / workbuddy-intl 写 |
 | db | file | many | 单文件式正文库 | opencode / mimo / kilo / zcode / cursor / minimax 读写 |
@@ -475,12 +478,12 @@ kilo 同时存在 `kilo.db` 与 `~/.kilo/tasks` 时，门会指向 `tasks`、实
 
 ## 可写性汇总
 
-| 可写（18） | 只读（3） |
+| 可写（19） | 只读（2） |
 | --- | --- |
-| claude、pi、codex、codebuddy、codebuddy-ide、workbuddy-cn、workbuddy-intl、opencode、mimo、dsh、freebuff、cline、kilo、roo、zcode、minimax、qoder-cn、qoder-intl | antigravity、cursor、doubao |
+| claude、pi、codex、codebuddy、codebuddy-ide、workbuddy-cn、workbuddy-intl、opencode、mimo、dsh、freebuff、cline、kilo、roo、zcode、minimax、qoder-cn、qoder-intl、antigravity | cursor、doubao |
 
 zcode / minimax 本轮由只读转为可写，取证结论见 [`agent-storage.md`](agent-storage.md) 对应变体。
-`roo` 按**代码实际**登记为可写（与 cline/kilo 共用 `createClineFamilyWriter`，也在 17 目标矩阵里），
+`roo` 按**代码实际**登记为可写（与 cline/kilo 共用 `createClineFamilyWriter`，也在 18 目标矩阵里），
 但本机没有任何宿主内成功样本（任务索引为空、宿主版本已停更）—— 计划 D5 原本要求它保持只读，
 代码并未按 D5 收敛，此处如实记录这处偏离，不以文档掩盖。
 
