@@ -98,7 +98,7 @@ SQLite 不强制列类型与长度，文档里出现的类型按以下语义理�
 | claude | cli | 否 | cli→claude | `~/.claude/` | `~/.claude/`（桌面客户端是另一个消费端产品，不落此根） | cli | 【真机】 |
 | pi | cli | 否 | cli→pi | `~/.pi/` | `~/.pi/` | cli | 【真机】 |
 | antigravity | cli+ide-plugin+desktop | 是 | cli/ide-plugin/desktop→antigravity（同一变体，按 role 分流） | `antigravity/Antigravity.exe`（桌面）、`Antigravity IDE/`（IDE，本机空目录）、`~/.gemini/antigravity-cli/`（CLI） | Hub `~/.gemini/antigravity/`（读写）、CLI `~/.gemini/antigravity-cli/`（读）、IDE `~/.gemini/antigravity-ide/`（旧 `.pb` 跳过）、备份 `~/.gemini/antigravity-backup/`（旧 `.pb` 跳过） | cli+desktop 读写；ide 正文不可读 | 【源码】paths.js 三常量 ／【真机】；原待证-antigravity-1 已结案 |
-| codex | cli+ide-plugin+desktop | 待证 | cli→codex；ide-plugin / desktop→未接入 | `~/.codex/`（CLI）；IDE 扩展与桌面入口为官方另发的入口形态 | CLI `~/.codex/`；扩展与桌面形态是否复用此根未取证 | cli | 【真机】CLI ／【待证 待证-codex-3】 |
+| codex | cli+ide-plugin+desktop | 待证 | cli→codex；desktop→codex（官方桌面端并入 ChatGPT/Codex 桌面应用，已证实同根）；ide-plugin→未接入 | `~/.codex/`（CLI）；桌面端同根 `~/.codex/`（MSIX `OpenAI.Codex_26.1111.9664.0` 的注册表与 rollout 都在此，已证实）；IDE 扩展入口为官方另发的入口形态 | CLI `~/.codex/`；桌面形态同根 `~/.codex/`（已证实）；IDE 扩展形态是否复用此根未取证 | cli | 【真机】CLI+desktop ／【源码】桌面端 app.asar ／【待证 待证-codex-3】 |
 | codebuddy | cli+ide-plugin | 是 | cli→codebuddy；ide-plugin→codebuddy-ide | `~/.codebuddy/`（CLI）、`%LOCALAPPDATA%/CodeBuddyExtension/Data/`（IDE 插件） | 两套互不相同的根（CLI 项目目录 vs 扩展 Data） | 两者 | 【真机】 |
 | workbuddy | desktop | 否 | desktop→workbuddy-cn / workbuddy-intl（按版次分变体） | `WorkBuddy.exe`（中文版）、`WorkBuddyAI` 安装体（国际版） | 中文版 `~/.workbuddy/`；国际版 `~/.workbuddy-ai/` | desktop | 【真机】 |
 | qoder | desktop+cli | 是 | desktop+cli→qoder-cn / qoder-intl（按版次分变体） | `Qoder CN.exe` / `Qoder.exe`、`~/.qoder-cn/bin/` / `~/.qoder/bin/` | 桌面注册表 `%APPDATA%/com.qoder*.app.stable/`；CLI 正文 `~/.qoder-cn/` / `~/.qoder/` | 两者 | 【真机】 |
@@ -926,7 +926,8 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 <CODEX_HOME> = <home>/.codex/
 ├── sessions/YYYY/MM/DD/                 # 会话正文：按日期分层
 │   └── rollout-<ISO>-<id>.jsonl         # 一会话 = 一个 rollout 文件（可压缩为 .jsonl.zst）
-├── .codex-global-state.json             # 会话注册表：列表可见性的硬前置
+├── .codex-global-state.json             # 会话注册表：列表可见性的硬前置；整体按账户分区（owner 空间）
+├── .codex-global-state.sqlite           # 注册表的库形态（新版桌面端在用；同键同分区规则）
 ├── state_5.sqlite                       # 线程库：threads / projects / project_roots 等
 ├── sqlite/                              # 另一组状态库（goals / logs / memories / automations / queue）
 ├── archived_sessions/ rollout-migrations/  # 归档会话与 rollout 迁移产物
@@ -1035,8 +1036,8 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
-| 列表来源 | 注册表 `.codex-global-state.json` 是可见性的**硬前置**：只写 rollout 文件的会话宿主侧栏不列；需读-改-写并保留未知键 | 【真机】 |
-| 打开正文依赖 | 非项目：`projectless-thread-ids` 含该 id、`thread-workspace-root-hints[id]` = 桶根字符串、`thread-projectless-output-directories[id]` = `<会话目录>/outputs`，**不**挂 `thread-project-assignments`；项目：`thread-project-assignments[id]` = `{projectKind:"local", projectId}`、`local-projects[projectId]` = `{id, name, rootPaths:[repo根], createdAt, updatedAt}`、projectId 进 `project-order` | 【真机】 |
+| 列表来源 | 注册表 `.codex-global-state.json` 是可见性的**硬前置**：只写 rollout 文件的会话宿主侧栏不列；需读-改-写并保留未知键；注册表整体按**账户分区**（owner 空间）存放 | 【真机】 |
+| 打开正文依赖 | 非项目：`projectless-thread-ids`（**顶层**）含该 id、`thread-workspace-root-hints[id]` = 桶根字符串、`thread-projectless-output-directories[id]` = `<会话目录>/outputs`（后两者在 **owner 分区键** `electron-owner-value:<key>:<ownerId>` 下，顶层裸键宿主**读不到**），**不**挂 `thread-project-assignments`；项目：`thread-project-assignments[id]` = `{projectKind:"local", projectId}`、`local-projects[projectId]` = `{id, name, rootPaths:[repo根], createdAt, updatedAt}`、projectId 进 `project-order`（这两项**仍在顶层**） | 【真机】键结构 ／【源码】宿主 storageKey→a6 只解析 owner 空间键 |
 | 标题裁决 | 线程库 `threads.title` | 【真机】 |
 | 缺字段后果 | 宿主列表是否按 `creator_user_id` 过滤（决定切账号后旧会话是否可见） | 【待证 待证-codex-1】 |
 
@@ -1047,7 +1048,7 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | 项目判定 | `session_meta` 有 `git` 键 + `thread-project-assignments` 归属为项目；非项目判据为「无 `git` 键」或 cwd 命中 `~/Documents/Codex` | 【真机】 |
 | 会话归属键 | `thread-project-assignments[id]` = `{projectKind:"local", projectId}`（注册表键控；正文 `session_meta` 只有 `git` 信号） | 【真机】 |
 | 项目注册表 | `local-projects[projectId]` = `{id, name, rootPaths:[repo根], createdAt, updatedAt}`；projectId 进 `project-order`；`local-projects` 按安装共享，与账号无关 | 【真机】 |
-| 非项目会话 | 非项目线程挂 `projectless-thread-ids` + `thread-workspace-root-hints[id]`（= 桶根字符串）+ `thread-projectless-output-directories[id]`（= `<会话目录>/outputs`），**不**挂 assignments；桶 `~/Documents/Codex/<YYYY-MM-DD>/<slug>/` | 【真机】 |
+| 非项目会话 | 非项目线程挂 `projectless-thread-ids`（顶层）+ `thread-workspace-root-hints[id]`（= 桶根字符串）+ `thread-projectless-output-directories[id]`（= `<会话目录>/outputs`）—— 后两者落在 **owner 分区键** `electron-owner-value:<key>:<ownerId>` 下，`<ownerId>` = `electron-renderer-content-owner` 记的当前账户（或注册表里唯一的 owner 空间）；**不**挂 assignments；桶 `~/Documents/Codex/<YYYY-MM-DD>/<slug>/` | 【真机】键结构 ／【源码】宿主只解析 owner 空间键 |
 | 项目显示名 | `local-projects[*].name` | 【真机】 |
 
 ### V9 元数据与特殊会话
@@ -3210,7 +3211,7 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | 3. claude | uuid | `projects/<slug>/<sessionId>.jsonl` 追加事件行（`uuid` / `parentUuid` 链、`sessionId`、`cwd`） | 追加须接在末行 `uuid` 之后（`parentUuid` 线性续接） | 【真机】 未知 `type` 行宿主忽略（见 §3 V6） |
 | 4. pi | uuid（内嵌文件名 `<ISO>_<id>.jsonl`） | `sessions/<slug>/<ISO>_<id>.jsonl`（首行 `session` 头） | —（单一文件即全部） | 【待证 待证-pi-1】 未知事件行的容忍性未取证 |
 | 5. antigravity | 不可写（steps 二进制无安全构造路径） | — | — | — |
-| 6. codex | uuid（`rollout-<ISO>-<uuid>.jsonl`） | rollout 文件 + `.codex-global-state.json` 读-改-写（注册表是可见性硬前置） | 追加进 `.jsonl.zst` 需整帧解压→追加→重压一帧→原子替换 | 【待证 待证-codex-2】 rollout 对未知事件行的容忍性未取证 |
+| 6. codex | uuid（`rollout-<ISO>-<uuid>.jsonl`） | rollout 文件 + `.codex-global-state.json` 读-改-写（注册表是可见性硬前置；路径提示两键须落 owner 分区键 `electron-owner-value:<key>:<ownerId>`，顶层裸键宿主读不到） | 追加进 `.jsonl.zst` 需整帧解压→追加→重压一帧→原子替换 | 【待证 待证-codex-2】 rollout 对未知事件行的容忍性未取证 |
 | 7–8. workbuddy-cn / workbuddy-intl | uuid | jsonl 正文 + `sessions` 表行（缺一不可，见 §7 V7）；新版有 `spaces` 表时，项目会话的 `sessions.space_id` 还须命中 active 空间，否则项目页不列（见 §8 V8） | 索引行缺失或落后则侧栏不列；`space_id` 留 NULL 则项目页不列 | 【待证 待证-workbuddy-1】 未知事件行的容忍性未取证 |
 | 9–10. qoder-cn / qoder-intl | 会话 id（CLI jsonl 文件名） | CLI jsonl + `chat_sessions` 行 + `chat_session_messages` 投影（`workspace_id` 须命中 `workspaces`） | 旧代 `local.db` 密文不可写 | 【待证 待证-qoder-1】 未知事件行的容忍性未取证 |
 | 11. zcode | `sess_<uuid>`（宿主校验正则） | 正文库 `session` / `message` / `part` 行 + 列表库 `tasks` 行（两库缺一不可） | 只写正文库不会出现在侧栏 | 【待证 待证-zcode-2】 未知 `session_entry` 行 / 列表库行的容忍性未取证 |
@@ -3236,7 +3237,7 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | --- | --- | --- | --- |
 | 待证-claude-1 | claude | 宿主加载外部构造 JSONL 的 oracle（`parentUuid` 断链后果） | 探针会话写入后用 Claude Code 打开并核对侧栏与正文 |
 | 待证-antigravity-1 | antigravity | IDE 与桌面形态的会话根（菜单里的会话是否与 `~/.gemini/antigravity-cli/` 同源；`%APPDATA%/Antigravity/` 里是否有正文） | 打开 Antigravity IDE 产生一条会话，比对两处目录的写入 |
-| 待证-codex-3 | codex | IDE 扩展与桌面入口是否复用 `~/.codex/`（官方已把桌面入口并入 ChatGPT 桌面端） | 装 IDE 扩展与桌面端各产生一条会话，比对 `~/.codex/sessions` 与桌面端数据目录 |
+| 待证-codex-3 | codex | IDE 扩展形态是否复用 `~/.codex/`（桌面形态已证实同根：MSIX `OpenAI.Codex_26.1111.9664.0` 的注册表与 rollout 都在 `~/.codex/`） | 装 IDE 扩展并产生一条会话，比对 `~/.codex/sessions` 与扩展自身数据目录 |
 | 待证-roo-3 | roo | 是否存在 CLI 形态（本机 `~/.roo` 下只有规则与技能，无会话与可执行） | 查官方发行物或安装 CLI 后确认会话落点 |
 | 待证-opencode-1 | opencode | 三表 schema 的 `session_entry` 表对未知 `type` 行的容忍性 | 找三表 schema 的库样本，或源码取证该表的读写路径 |
 | 待证-zcode-1 | zcode | 宿主加载外部构造会话的 oracle（CLI / 桌面能列出并打开；读侧已覆盖） | zcode CLI 加载探针会话（镜像验收 + CLI oracle） |

@@ -428,6 +428,13 @@ WorkBuddy 的 `transport`/`unread`/`thought_level` 就不在 baseline 里 ——
   （收敛安全）。验证：`test/m86-opencode-reasoning-native.test.mjs`（含 red-green 取证）。
 - codex 注册表 `.codex-global-state.json` 读-改-写 + 备份 + 保留未知键；正文可能是 `.jsonl` 或
   宿主压缩过的 `.jsonl.zst`，追加时按 id 找回原文件，`.zst` 走「整帧解压 → 追加 → 重新压成一帧 → 原子替换」。
+- codex 注册表的**路径提示两键按账户分区**：宿主把 `thread-workspace-root-hints` 与
+  `thread-projectless-output-directories` 放在 `electron-owner-value:<key>:<ownerId>` 下，顶层裸键**读不到**
+  （宿主的 storageKey→a6 只解析 owner 空间键，写顶层等于写死数据）。写侧据此定位 owner 空间：
+  ownerId 取注册表里的 `electron-renderer-content-owner`；取不到就用注册表里**唯一**的 owner 空间；
+  多个 owner 空间又没标记当前账户 → 不猜，退回顶层旧键并告警 `registry-owner-unresolved`
+  （新版本体可能不显示 —— 宁可如实报，也不写进身份不明的空间）。
+  `projectless-thread-ids` / `thread-project-assignments` / `local-projects` 宿主仍留在顶层，不动。
 - codebuddy-ide：append 进已有会话不再注入 `<user_info>`，首条消息的 Workspace Folder 只在搬迁时改写；
   relocate 先把会话目录备份到 `<home>/.session-sync/backups/codebuddy-ide/`。
 - codebuddy-ide 写哪一份 history（`resolveHistoryRoot`）按档位定：钉住 `CODEBUDDY_EXTENSION_HISTORY` > `--account` 命中的账号坐标 > 本机唯一账号坐标（指定账号没有目录时告警 `account-root-unmatched`，不擅自改道、写进唯一那份）> 多账号并存且没点名 → `account-ambiguous`，**一个字节都不写**，让用户先用 `accounts` 看 uid 再点名 > 一个坐标都没有（本机从没开过这个 IDE）→ 按 user/ide 坐标派生。已撤掉「按 mtime 谁最近被改过挑账号」的旧口径：活动度只解释在用情况，不决定该写哪儿，冷账号会被挤掉，用户以为导进了 B、实际写进了 A。
@@ -463,7 +470,7 @@ WorkBuddy 的 `transport`/`unread`/`thought_level` 就不在 baseline 里 ——
 | antigravity | desktop | hub | `~/.gemini/antigravity/` | ✅ | ✅ | Hub 活库：`conversations/<id>.db` + `conversation_summaries.db` 双写 |
 | codex | cli | sessions | `~/.codex/` | ✅ | ✅ | 归档目录用 `archive` role、只读不写（不进导入候选）；判定不再靠目录名 |
 | codex | ide-plugin | 未声明 | 未取证 | ❌ | ❌ | 是否复用 `~/.codex/` 待证（待证-codex-3） |
-| codex | desktop | 未声明 | 未取证 | ❌ | ❌ | 官方已并入 ChatGPT 桌面端 |
+| codex | desktop | 未声明 | 未取证 | ❌ | ❌ | 已证实桌面端与 CLI 同根（`~/.codex/`），但该形态尚未接入本程序 |
 | codebuddy | cli | projects | `~/.codebuddy/projects/` | ✅ | ✅ | 写侧已改走 `writeRootOf`，搬根后不再写回默认位置 |
 | codebuddy | ide-plugin | data | `%LOCALAPPDATA%/CodeBuddyExtension/Data/` | ✅ | ✅ | 扩展缓存结构，含账号分区 |
 | qoder | desktop | registry | `%APPDATA%/com.qoder*.app.stable/main.sqlite` | ✅ | ✅ | 写入含 `chat_sessions` 与消息投影 |

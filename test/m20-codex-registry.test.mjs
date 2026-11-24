@@ -51,6 +51,26 @@ function claudeSource(root, id, cwd, texts) {
 const firstLine = (file) => JSON.parse(fs.readFileSync(file, 'utf8').split('\n').find((l) => l.trim()));
 const readRegistry = (root) => JSON.parse(fs.readFileSync(ROOT_JSON(root), 'utf8'));
 
+// 宿主把注册表拆成「按账户分区」的 owner 空间（【源码】app.asar 26.1111.9664.0）：
+// 路径提示两键在 electron-owner-value:<key>:<ownerId>，顶层裸键宿主读不到
+const OWNER_VALUE_PREFIX = 'electron-owner-value:';
+const CONTENT_OWNER_KEY = 'electron-renderer-content-owner';
+
+/** 取一个键的现网形态：顶层裸键 + 所有 owner 空间的并集（owner 空间优先）。 */
+function collectOwnerScoped(st, key) {
+  const out = { ...(st[key] && typeof st[key] === 'object' ? st[key] : {}) };
+  for (const k of Object.keys(st)) {
+    if (k.startsWith(OWNER_VALUE_PREFIX) && k.slice(OWNER_VALUE_PREFIX.length).startsWith(`${key}:`)) {
+      Object.assign(out, st[k]);
+    }
+  }
+  return out;
+}
+
+function ownerSpaceKeys(st, key) {
+  return Object.keys(st).filter((k) => k.startsWith(`${OWNER_VALUE_PREFIX}${key}:`));
+}
+
 test('codex 非项目：session_meta 无 git、cwd=桶内目录、runtime_workspace_roots=桶根，并写满三个注册表键', () => {
   const root = tmpRoot('codex-none');
   const bucketCwd = J(path.join(root, 'WorkBuddy', '2026-10-08-18-38-21'));
@@ -164,17 +184,96 @@ test('现网等值：宿主自己登记的非项目线程，三个键的形状�
   const ids = (st['projectless-thread-ids'] ?? []).slice(0, 20);
   assert.ok(ids.length > 0, '本机没有非项目线程，无从对照');
   const root = bucketRoot(real, 'codex');
+  // 现网形态：路径提示两键可能已被宿主迁进 owner 空间，顶层裸键要一并看
+  const hints = collectOwnerScoped(st, 'thread-workspace-root-hints');
+  const outs = collectOwnerScoped(st, 'thread-projectless-output-directories');
   let checked = 0;
   for (const id of ids) {
-    const hint = st['thread-workspace-root-hints']?.[id];
+    const hint = hints[id];
     if (hint === undefined) continue;
     assert.equal(hint, root, `hints[${id}] 必须是桶根（实测形态）`);
     checked++;
   }
   assert.ok(checked > 0, '对照样本为空');
-  const dirs = Object.values(st['thread-projectless-output-directories'] ?? {});
+  const dirs = Object.values(outs);
   assert.ok(dirs.length > 0);
   assert.ok(dirs.every((d) => String(d).endsWith('outputs')), '输出目录一律以 outputs 结尾');
+  // 现网若已切到 owner 空间，顶层裸键就该是空的（有则说明宿主还在用旧形态）
+  const hintSpaces = ownerSpaceKeys(st, 'thread-workspace-root-hints');
+  if (hintSpaces.length > 0) {
+    assert.ok(!st['thread-workspace-root-hints'], '宿主已切 owner 空间，顶层裸键不该再有路径提示');
+    assert.ok(typeof st[CONTENT_OWNER_KEY] === 'string', 'owner 空间形态必须有 content-owner 标记');
+  }
+});
+
+test('codex owner 空间形态：路径提示必须写进 electron-owner-value:<key>:<ownerId>，顶层裸键不写', () => {
+  const root = tmpRoot('codex-owner');
+  const OWNER = 'a'.repeat(64);
+  fs.mkdirSync(path.dirname(ROOT_JSON(root)), { recursive: true });
+  fs.writeFileSync(
+    ROOT_JSON(root),
+    JSON.stringify(
+      {
+        'projectless-thread-ids': [],
+        [CONTENT_OWNER_KEY]: OWNER,
+        [`electron-owner-atoms:${OWNER}`]: { 'seen-model-upgrade-list': [] },
+        [`${OWNER_VALUE_PREFIX}thread-workspace-root-hints:${OWNER}`]: {},
+        'some-unknown-flag': { keep: true },
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  );
+  const bucketCwd = J(path.join(root, 'Documents', 'Codex', '2026-11-24', 'demo'));
+  claudeSource(root, 's9', bucketCwd, ['桶里的会话']);
+  const ctx = ctxFor(root);
+  const r = executePlan(ctx, planImport(ctx, { from: ['claude'], into: ['codex'] }), { apply: true, lock: false })[0];
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.placement.scope, 'none');
+
+  const st = readRegistry(root);
+  const hints = st[`${OWNER_VALUE_PREFIX}thread-workspace-root-hints:${OWNER}`];
+  const outs = st[`${OWNER_VALUE_PREFIX}thread-projectless-output-directories:${OWNER}`];
+  assert.equal(hints?.[r.targetId], bucketRoot(ctx, 'codex'), '路径提示必须落在 owner 分区键（宿主只读它）');
+  assert.equal(J(outs?.[r.targetId]), J(path.join(r.placement.directory, 'outputs')));
+  assert.equal(st['thread-workspace-root-hints']?.[r.targetId], undefined, '顶层裸键宿主读不到，不许再写');
+  assert.equal(st['thread-projectless-output-directories']?.[r.targetId], undefined, '顶层裸键宿主读不到，不许再写');
+  assert.ok(st['projectless-thread-ids'].includes(r.targetId), '非项目名单仍在顶层（宿主没迁它）');
+  assert.deepEqual(st['some-unknown-flag'], { keep: true }, '未知键必须原样保留');
+});
+
+test('codex 多 owner 空间且未标当前账户：退回顶层旧键并告警', () => {
+  const root = tmpRoot('codex-multi-owner');
+  const O1 = 'b'.repeat(64);
+  const O2 = 'c'.repeat(64);
+  fs.mkdirSync(path.dirname(ROOT_JSON(root)), { recursive: true });
+  fs.writeFileSync(
+    ROOT_JSON(root),
+    JSON.stringify(
+      {
+        'projectless-thread-ids': [],
+        [`electron-owner-atoms:${O1}`]: {},
+        [`electron-owner-atoms:${O2}`]: {},
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  );
+  const bucketCwd = J(path.join(root, 'Documents', 'Codex', '2026-11-24', 'demo2'));
+  claudeSource(root, 's10', bucketCwd, ['多账户场景']);
+  const ctx = ctxFor(root);
+  const r = executePlan(ctx, planImport(ctx, { from: ['claude'], into: ['codex'] }), { apply: true, lock: false })[0];
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.ok(
+    (r.warnings ?? []).some((w) => String(w).includes('registry-owner-unresolved')),
+    `必须告警说明退回顶层旧键：${JSON.stringify(r.warnings)}`,
+  );
+  const st = readRegistry(root);
+  assert.equal(st['thread-workspace-root-hints']?.[r.targetId], bucketRoot(ctx, 'codex'), '退回顶层旧键（保底）');
+  assert.equal(st[`${OWNER_VALUE_PREFIX}thread-workspace-root-hints:${O1}`]?.[r.targetId], undefined, '不许乱写 owner 空间');
+  assert.equal(st[`${OWNER_VALUE_PREFIX}thread-workspace-root-hints:${O2}`]?.[r.targetId], undefined, '不许乱写 owner 空间');
 });
 
 test('codex 标题取 state_<N>.sqlite 的 threads（name 优先，其次 title），不是首条消息', () => {

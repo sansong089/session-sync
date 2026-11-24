@@ -78,11 +78,69 @@ function resolveAccount(ctx, account) {
   return cur ? { userId: cur.id, accountId: cur.accountId } : {};
 }
 
+// 宿主把注册表拆成「按账户分区」的 owner 空间（【源码】app.asar 26.1111.9664.0）：
+//   electron-owner-value:<key>:<ownerId>  ← thread-workspace-root-hints / thread-projectless-output-directories
+//   electron-renderer-content-owner       ← 当前登录账户的 ownerId
+//   electron-owner-atoms:<ownerId>        ← 该账户的其它偏好
+// 宿主读这两个键时只解析 owner 分区键（storageKey → a6 → w(key)+ownerId），
+// 顶层裸键读不到 —— 写顶层等于写死数据（真机实测：宿主已把顶层裸键迁空）。
+// 注意 projectless-thread-ids / thread-project-assignments / local-projects 仍留在顶层。
+const OWNER_VALUE_PREFIX = 'electron-owner-value:';
+const OWNER_ATOMS_PREFIX = 'electron-owner-atoms:';
+const CONTENT_OWNER_KEY = 'electron-renderer-content-owner';
+const OWNER_SCOPED_KEYS = ['thread-workspace-root-hints', 'thread-projectless-output-directories'];
+
+/** 扫出注册表里出现过的 owner 空间 id（owner-value 键取最后一段，owner-atoms 键取整段）。 */
+function ownerIdsOf(st) {
+  const ids = new Set();
+  for (const key of Object.keys(st ?? {})) {
+    if (key.startsWith(OWNER_VALUE_PREFIX)) {
+      const id = key.slice(OWNER_VALUE_PREFIX.length).split(':').pop();
+      if (id) ids.add(id);
+    } else if (key.startsWith(OWNER_ATOMS_PREFIX)) {
+      const id = key.slice(OWNER_ATOMS_PREFIX.length);
+      if (id) ids.add(id);
+    }
+  }
+  return [...ids];
+}
+
+/**
+ * 当前该往哪个 owner 空间写：宿主自己记的 content-owner 优先；
+ * 只有一个 owner 空间时就是它；多个空间又没标记 → 不猜（宁可退顶层旧键并告警）。
+ */
+function resolveOwnerId(st) {
+  const cur = st?.[CONTENT_OWNER_KEY];
+  if (typeof cur === 'string' && cur) return cur;
+  const ids = ownerIdsOf(st);
+  return ids.length === 1 ? ids[0] : null;
+}
+
+/**
+ * 改一个 owner 分区键：只动目标条目，别的线程内容原样保留。
+ * 有 owner 空间就写 owner 空间（宿主 storageKey→a6 只解析 owner 空间键，顶层裸键读不到）；
+ * 没有 owner 空间才退回顶层裸键（旧宿主形态）。
+ */
+function applyOwnerScoped(st, key, ownerId, fn) {
+  const touch = (obj) => fn(obj && typeof obj === 'object' ? obj : {});
+  for (const id of ownerIdsOf(st)) {
+    const k = `${OWNER_VALUE_PREFIX}${key}:${id}`;
+    if (st[k] && typeof st[k] === 'object') st[k] = touch(st[k]);
+  }
+  if (ownerId) {
+    const k = `${OWNER_VALUE_PREFIX}${key}:${ownerId}`;
+    st[k] = touch(st[k]);
+  } else {
+    st[key] = touch(st[key]);
+  }
+}
+
 /**
  * 把线程登记进宿主的注册表（读-改-写，未知键原样保留，改写前留备份）。
- * 键形全部按本机 .codex-global-state.json 实测抄录：
- *   非项目：projectless-thread-ids[id] + thread-workspace-root-hints[id]=桶根
- *          + thread-projectless-output-directories[id]=<会话目录>/outputs，且不挂 assignments
+ * 键形按本机 .codex-global-state.json 实测抄录：
+ *   非项目：projectless-thread-ids[id]（顶层）+ owner 分区的
+ *          thread-workspace-root-hints[id]=桶根
+ *          thread-projectless-output-directories[id]=<会话目录>/outputs，且不挂 assignments
  *   项目：  thread-project-assignments[id]={projectKind:'local',projectId}
  *          + local-projects[projectId]={id,name,rootPaths,createdAt,updatedAt} + project-order
  * @returns {string[]} warnings
@@ -103,20 +161,15 @@ function registerThread(ctx, { targetId, scope, cwd, account }) {
   backupIfExists(file, ctx, 'codex');
 
   const list = Array.isArray(st['projectless-thread-ids']) ? st['projectless-thread-ids'] : [];
-  const hints = st['thread-workspace-root-hints'] && typeof st['thread-workspace-root-hints'] === 'object' ? st['thread-workspace-root-hints'] : {};
-  const outs = st['thread-projectless-output-directories'] && typeof st['thread-projectless-output-directories'] === 'object' ? st['thread-projectless-output-directories'] : {};
+  const ownerId = resolveOwnerId(st);
   const asg = st['thread-project-assignments'] && typeof st['thread-project-assignments'] === 'object' ? st['thread-project-assignments'] : {};
   const projects = st['local-projects'] && typeof st['local-projects'] === 'object' ? st['local-projects'] : {};
   const order = Array.isArray(st['project-order']) ? st['project-order'] : [];
   if (scope === 'none') {
     if (!list.includes(targetId)) list.push(targetId);
-    hints[targetId] = bucket;
-    outs[targetId] = path.join(String(cwd || bucket), 'outputs');
     delete asg[targetId];
   } else {
     st['projectless-thread-ids'] = list.filter((x) => x !== targetId);
-    delete hints[targetId];
-    delete outs[targetId];
     const key = normPath(cwd);
     let projectId = Object.keys(projects).find((id) => (projects[id]?.rootPaths ?? []).some((r) => normPath(r) === key));
     if (!projectId) {
@@ -137,8 +190,23 @@ function registerThread(ctx, { targetId, scope, cwd, account }) {
   }
 
   st['projectless-thread-ids'] = scope === 'none' ? list : st['projectless-thread-ids'];
-  st['thread-workspace-root-hints'] = hints;
-  st['thread-projectless-output-directories'] = outs;
+  // 路径提示两键必须落在 owner 分区：宿主 storageKey→a6 只解析 owner 空间键，顶层裸键它读不到
+  const setOrDel = (obj, id, val) => {
+    const next = { ...obj };
+    if (val === undefined) delete next[id];
+    else next[id] = val;
+    return next;
+  };
+  const values = {
+    'thread-workspace-root-hints': scope === 'none' ? bucket : undefined,
+    'thread-projectless-output-directories': scope === 'none' ? path.join(String(cwd || bucket), 'outputs') : undefined,
+  };
+  for (const key of OWNER_SCOPED_KEYS) {
+    applyOwnerScoped(st, key, ownerId, (obj) => setOrDel(obj, targetId, values[key]));
+  }
+  if (!ownerId && ownerIdsOf(st).length > 1) {
+    warnings.push('registry-owner-unresolved: 宿主注册表有多个账户 owner 空间且未标记当前账户，路径提示已退回顶层旧键（新版本体只读 owner 空间，可能不显示）');
+  }
   st['thread-project-assignments'] = asg;
   try {
     writeFileAtomic(file, JSON.stringify(st, null, 2));
