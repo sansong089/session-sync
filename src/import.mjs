@@ -250,6 +250,24 @@ function syncTitleIfChanged({ writer, ctx, target, targetId, sourceTitle, target
 }
 
 /**
+ * 身份无据时**唯一允许的结论**：内容已经在了（什么都不做）。
+ *
+ * 只认两种「不动作」的结论：
+ *   - identical    —— 源与目标内容逐轮一致，这条会话已经在目标里了
+ *   - target-ahead —— 目标的内容是源的超集（源没有新东西可写）
+ * 其余（目标是源的严格前缀 / 双方分叉）一律返回 null，交给调用方判 fork + identity-mismatch：
+ * 那两种都要**往目标里写**，而身份旁证已经没了，写进去可能污染别人的会话（m4 的底线）。
+ *
+ * @returns {'identical'|'target-ahead'|null}
+ */
+function decideWithoutIdentity(sourceSession, targetSession) {
+  const srcFp = sessionCoreFingerprints(sourceSession);
+  const dstFp = sessionCoreFingerprints(targetSession);
+  if (srcFp.length === dstFp.length && srcFp.every((f, i) => f === dstFp[i])) return 'identical';
+  if (isFpPrefix(srcFp, dstFp)) return 'target-ahead';
+  return null;
+}
+/**
  * 唯一的 (源, 目标) 决策：在同 originKey、未归档的候选集里做包含关系三分法。
  *   - 完全相同            → skip（命中的不是基础 ID 时标 fork-converged）
  *   - 候选 ⊂ 源（严格前缀）→ append 到最长的候选（fork 也能被续写）
@@ -258,6 +276,7 @@ function syncTitleIfChanged({ writer, ctx, target, targetId, sourceTitle, target
  * 归档会话只作存在性判定：不作候选；没有任何活跃候选时，归档行 → skip(target-archived)，
  * 源与目标是同一条会话（round-trip）→ skip(round-trip-self)。
  * 基础 ID 上坐着不同身份的会话 → fork + identity-mismatch，绝不 append。
+ * 身份旁证（来源标记）丢失时：只允许「已经在那儿」的结论，见 decideWithoutIdentity。
  */
 function resolveDecision(target, sourceSession, index, readSessionFn) {
   const baseId = String(targetSessionId(target, sourceSession));
@@ -326,6 +345,34 @@ function resolveDecision(target, sourceSession, index, readSessionFn) {
       };
     }
     if (!baseSession) return { action: 'create', targetId: baseId, at: 0, reason: 'target-unreadable', sameLineage: false, baseId, parentId: null, targetSession: null };
+    // 归档行只作存在性判定（D1）：它不是一条活会话，「已经在那儿」这个结论对它不成立 ——
+    // 哪怕内容一模一样，也得把源另导一条新的（m28 钉住的就是这条）。
+    if (baseSummary?.archived === true) {
+      const d = decideAction(sourceSession, baseSession, false);
+      return { ...forkFrom(target, sourceSession, baseId, baseId, d.at ?? 0, d.reason ?? 'identity-mismatch', false), targetSession: baseSession };
+    }
+    // 身份无据（来源标记被宿主抹掉 / 老版本导入没写标记）时的处置：
+    //   **只允许「已经在那儿」的结论**（内容完全一致 → identical；目标是源的超集 → target-ahead），
+    //   两者都是「什么都不做」；**绝不往里续写**（append / 分叉一律 fork + identity-mismatch）。
+    //
+    // 为什么这样切：目标 id 是按 originKey **确定性派生**出来的（宿主原生 id 不会撞上），
+    //   所以「这个位置原本就是这条源的导入位」这件事仍然成立 —— 标记只是「内容同宗」的旁证，
+    //   旁证没了不等于事实不成立。但既然旁证没了，就不能确认它现在的内容与这条源同宗，
+    //   往里写就可能写进别人的会话（m4 钉住的就是这条底线：宁可 fork 也不污染）。
+    //   而「内容一致 / 目标更长」这两个结论只是**不动作**，写不坏任何东西。
+    const noIdentity = decideWithoutIdentity(sourceSession, baseSession);
+    if (noIdentity) {
+      return {
+        action: 'skip',
+        targetId: baseId,
+        at: 0,
+        reason: noIdentity,
+        sameLineage: false,
+        baseId,
+        parentId: baseId,
+        targetSession: baseSession,
+      };
+    }
     const d = decideAction(sourceSession, baseSession, false);
     return { ...forkFrom(target, sourceSession, baseId, baseId, d.at ?? 0, d.reason ?? 'identity-mismatch', false), targetSession: baseSession };
   }

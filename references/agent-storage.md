@@ -2020,7 +2020,7 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
-| 会话正文载体 | `v2/sessions/<history_relative_dir>/messages.jsonl` + `manifest.json` — 正文首选源 | 【真机】 |
+| 会话正文载体 | `v2/sessions/<history_relative_dir>/messages.jsonl` + `manifest.json` — 正文首选源（也是**模型上下文**的来源）；`local_runtime_message_rows` 是次选（界面消息列表与读侧工具走它） | 【真机】【源码】 |
 | 列表索引与注册表 | `v2/sqlite/runtime-state.sqlite` 的 `local_runtime_sessions` — 会话索引 / 列表源 | 【真机】 |
 | 非项目落点 | `~/.minimax/sessions/<id>/workspace` — 非项目会话桶（键是 ID，不含日期）；renderer localStorage（Chromium LevelDB）— 项目显示别名 | 【真机】 |
 
@@ -2029,8 +2029,8 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
 | 会话边界 | 一会话 = `local_runtime_sessions` 一行 + `messages.jsonl` 文件；`history_relative_dir` 留 NULL 时宿主按 `(session_id, created_at_ms)` 自己派生并绑定 | 【真机】 |
-| 会话 ID 形态 | `history_relative_dir` 形态为 `<日期>/<时间>-session_<base64url(sessionId)>`；磁盘真实层级是 `<YYYY>/<MM>/<DD>/<同上>`，**与库内值差一个日期前缀层**，不能拿库内值当路径直接拼 | 【真机】 |
-| 命名与目录派生 | 正文源选择链：`messages.jsonl → authoritativeLedgerSnapshot → local_runtime_message_rows → sqliteBlob`；DB 行缺失文件时才回退，`canonical-history-materializer` 会自己把 DB 行物化成 `messages.jsonl` | 【源码】 |
+| 会话 ID 形态 | `history_relative_dir` = `YYYY/MM/DD/HH-mm-ss-mmm-session_<base64url(sessionId)>`（**UTC，4 段斜杠**）；**库里的值就是磁盘相对路径**（`<v2/sessions>/<该值>`），可直接拼。宿主的校验：必须是 4 段、不含反斜杠、非绝对路径 | 【源码】【真机】 |
+| 命名与目录派生 | 正文源选择链：`messages.jsonl → authoritativeLedgerSnapshot → local_runtime_message_rows → sqliteBlob`；宿主物化器（`canonical-history-materializer`）在会话**没有 legacy 账本**时只发布**空文件**，不会从 DB 行回填 ⇒ 外部导入必须自己落规范文件，否则空文件会遮住导入正文 | 【源码】【真机】 |
 | 非项目桶 | `~/.minimax/sessions/<id>/workspace`（`generated` 形态） | 【真机】 |
 
 ### V5 存储格式与编码
@@ -2164,17 +2164,17 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
 | 存储实体 | `local_runtime_sessions` + `local_runtime_message_rows` + `local_runtime_projects`，逐列结构见下方表结构 | 【源码】 |
-| 关键列与约束 | **列表硬门（少一项整条不可见）**：`columnar_version=3`（不是 3 时 `decodeSessionRow` 直接 throw）、`agent_name IN ('mavis','main')`、`archived=0`、`visibility<>'hidden'`、`session_kind NOT IN ('peek','cron')` 等；枚举严格（违规即 SQLITE_CONSTRAINT）：`runtime ∈ {pi-agent, opencode}`、`session_type ∈ {root, branch}`、`status ∈ {idle, started, error, aborted, interrupted}`；`local_runtime_projects` 行由宿主在 `columnar_version=3` 会话插入时自动建行并回填 `project_id` | 【源码】 |
+| 关键列与约束 | **列表硬门（少一项整条不可见）**：`columnar_version=3`（不是 3 时 `decodeSessionRow` 直接 throw）、`agent_name IN ('mavis','main')`、`archived=0`、`visibility<>'hidden'`、`session_kind NOT IN ('peek','cron')` 等；枚举严格（违规即 SQLITE_CONSTRAINT）：`runtime ∈ {pi-agent, opencode}`、`session_type ∈ {root, branch}`、`status ∈ {idle, started, error, aborted, interrupted}`；`local_runtime_projects` 行由宿主在 `columnar_version=3` 会话插入时自动建行并回填 `project_id`；**导入的普通对话写 `session_type='branch'`**（`'root'` 是 Agent 的内部主会话，会被侧栏整体排除，见 V7） | 【源码】【真机】 |
 | 标题落点 | `local_runtime_sessions.title` | 【源码】 |
 
 ### V7 可见性与索引契约
 
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
-| 列表来源 | 来自 `local_runtime_sessions`，六个硬门全部满足才可见 | 【源码】 |
-| 打开正文依赖 | 见 V3 正文源选择链（文件 → 账本快照 → DB 行 → blob 四级回退） | 【源码】 |
-| 标题裁决 | `local_runtime_sessions.title` | 【源码】 |
-| 缺字段后果 | 宿主加载外部构造会话的 oracle（桌面能列出并打开）未取证；列表硬门目前是源码级结论 | 【待证 待证-minimax-1】 |
+| 列表来源 | 桌面侧栏读 `local_runtime_sessions`，判定走 `projects/sidebar/predicate.js` 的 `eligible()`：六个硬门（`columnar_version=3`、`agent_name IN ('mavis','main')`、`archived=0`、`visibility<>'hidden'`、`session_kind NOT IN ('peek','cron')`、`parent_session_id IS NULL`）**之外**还要过三道侧栏专属条件 —— ① 所在项目未隐藏且未被「移除项目」；② 不在**内部主会话**排除名单里；③ 会话类型落在「branch 普通对话 / branch channel / root 普通会话」三者之一。**内部主会话排除**：`listInternalDefaultRootIds` 把「`session_type='root'` 且 `session_kind='conversation'`」且（不是 legacy IM 标记、`extra_data_json` 里没有 `runLocation`）且（`is_default_workspace=1` 或落在 Agent 内部默认工作目录）的行判为 Agent 自己的 Main 会话，从侧栏整体排除 ⇒ **普通会话写成 `'root'` 时在桌面侧栏整条不可见**（库里有、运行时列表查得到、侧栏没有；六个硬门全过也没用）。导入侧必须写 `'branch'`，并在索引自愈通道里把老版本写出的 `'root'` 改回来（只改带本工具来源标记的行，宿主原生行不动） | 【源码】【真机】 |
+| 打开正文依赖 | 见 V3 正文源选择链（文件 → 账本快照 → DB 行 → blob 四级回退）；会话首次被宿主打开后，宿主会自己把 DB 行物化成 `messages.jsonl` 并绑定 `history_relative_dir`。**外部导入必须自己先写这份规范文件**（`messages.jsonl` + `manifest.json` + 行的 `history_relative_dir`）：宿主物化器在会话没有 legacy 账本时只会发布**空文件**，空文件一旦存在就是模型上下文的唯一来源 ⇒ 导入正文在模型上下文里消失（界面消息列表仍看得到，因为它读 DB 行）。文件已存在时物化器不覆盖，宿主后续回合直接追加在后面。**文件与 DB 行会分叉**：物化出的空文件里没有 DB 行的正文（宿主不回填），此后宿主只往文件里追加 —— 于是「文件里有几轮」与「DB 行里有几轮」可以是两个数 | 【源码】【真机】 |
+| 标题裁决 | `local_runtime_sessions.title`；侧栏的**标题搜索**另走 FTS5 虚表 `local_runtime_sessions_fts`，这份搜索文档**由宿主在会话首次被打开/物化时自己写**（外部预写会占掉宿主下一次分配的 FTS rowid —— 那张 rowid 登记表是自增的，必须与宿主同步），代价是会话被打开前搜不到 | 【源码】【真机】 |
+| 缺字段后果 | 外部构造会话的 oracle 已取证（见「列表来源」与「标题裁决」两行）：桌面侧栏能列出并打开，正文按 V3 的回退链读出。宿主首次物化会话时用自己的一套默认值重写 `extra_data_json`，**DB 行里的来源标记槽被抹掉** ⇒ 只靠那一列认不出「这条会话是导入来的」，来源标记必须另有一份落在宿主不碰的文件上 | 【真机】 |
 
 ### V8 项目与工作区归属
 
@@ -3240,7 +3240,6 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | 待证-roo-3 | roo | 是否存在 CLI 形态（本机 `~/.roo` 下只有规则与技能，无会话与可执行） | 查官方发行物或安装 CLI 后确认会话落点 |
 | 待证-opencode-1 | opencode | 三表 schema 的 `session_entry` 表对未知 `type` 行的容忍性 | 找三表 schema 的库样本，或源码取证该表的读写路径 |
 | 待证-zcode-1 | zcode | 宿主加载外部构造会话的 oracle（CLI / 桌面能列出并打开；读侧已覆盖） | zcode CLI 加载探针会话（镜像验收 + CLI oracle） |
-| 待证-minimax-1 | minimax | 宿主加载外部构造会话的 oracle（列表硬门是源码级结论） | 沙箱写入探针 + 宿主桌面加载，或 app.asar 里 decode 链路实证 |
 | 待证-freebuff-1 | freebuff | 宿主枚举并打开「以会话 id 直接命名」的目录的 oracle | 新增 freebuff 脚本：镜像写入 + 宿主 CLI/GUI oracle |
 | 待证-cline-1 | cline | 4.x 扩展能列出并打开外部构造的 manifest + messages + db 三件套 | VS Code + Cline 扩展加载探针会话（GUI 日志 oracle） |
 | 待证-kilo-1 | kilo | 宿主 UI 能看到外部构造会话（库 / 任务目录两条路径） | VS Code + Kilo 扩展加载探针会话 |

@@ -10,11 +10,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { VARIANTS, configRoot, userDataDirsOf } from '../hosts.mjs';
-import { makeSession, messageItem, reasoningItem, toolCallItem, toolResultItem, attachmentItem, metaItem, noteItem, finalizeSession } from '../ir.mjs';
+import { makeSession, messageItem, reasoningItem, toolCallItem, toolResultItem, attachmentItem, metaItem, noteItem, finalizeSession, turnCoreFingerprint } from '../ir.mjs';
 import { toPiBlock, toolResultItemOfRow } from '../pi-agent-blocks.mjs';
 import { compactionInjectionKind, compactionSummaryText } from '../text.mjs';
 import { provenanceFromObject, applyProvenanceToIR, readSidecarProvenance } from '../provenance.mjs';
-import { openDb, safeJson, tableExists, tableColumns, firstExisting, assembleTurns, deriveTitle, stripSystemInjections, parseJsonl, readHead, readTail, toMs, fileMtime, fileSize, inTimeRange,
+import { openDb, safeJson, tableExists, tableColumns, firstExisting, assembleTurns, deriveTitle, stripSystemInjections, parseJsonl, toMs, fileMtime, inTimeRange,
   parseArgs, outputText,
 } from './base.mjs';
 import { isFile, isDir, cmpPath } from '../util.mjs';
@@ -238,25 +238,22 @@ function toEntry(rec, fallbackTs) {
   return { role, ts, items };
 }
 
-function readV2Messages(dir, opts = {}) {
+function readV2Messages(dir) {
   const file = path.join(dir, 'messages.jsonl');
   if (!isFile(file)) return null;
   const manifestPath = path.join(dir, 'manifest.json');
   const manifest = safeJson(isFile(manifestPath) ? fs.readFileSync(manifestPath, 'utf8').trim() || '{}' : '{}', {}) || {};
-  // list 用采样（大文件读头尾），read 用全量
-  const sampleBytes = opts.sample ?? 0;
-  const size = fileSize(file);
-  let text;
-  if (sampleBytes > 0 && size > sampleBytes * 2) {
-    text = `${readHead(file, sampleBytes)}\n${readTail(file, sampleBytes)}`;
-  } else {
-    text = fs.readFileSync(file, 'utf8');
-  }
+  // 全量读：list 与 read 必须同口径（m53）。早先 list 走采样（大文件读头尾），
+  // 于是同一个会话 list 报 1 轮、read 报 67 轮 —— 用户按 list 挑会话，挑到的是错的。
+  const text = fs.readFileSync(file, 'utf8');
   const lines = parseJsonl(text);
   const entries = [];
+  // 文件里出现过的 turn_id：判「文件是不是缺了我们自己写的那几轮」要用
+  const turnIds = new Set();
   let createdAt = toMs(manifest.createdAtMs) || 0;
   let updatedAt = toMs(manifest.updatedAtMs) || 0;
   for (const rec of lines) {
+    if (rec?.turn_id) turnIds.add(String(rec.turn_id));
     const e = toEntry(rec, createdAt);
     if (!e) continue;
     if (e.ts) {
@@ -267,16 +264,19 @@ function readV2Messages(dir, opts = {}) {
   }
   return {
     entries,
+    turnIds,
     createdAt,
     updatedAt: updatedAt || fileMtime(file),
-    sampled: sampleBytes > 0 && size > sampleBytes * 2,
   };
 }
 
 function readRowMessages(db, sessionId) {
-  if (!tableExists(db, 'local_runtime_message_rows')) return { entries: [], createdAt: 0, updatedAt: 0 };
+  if (!tableExists(db, 'local_runtime_message_rows')) return { entries: [], ourEntries: [], createdAt: 0, updatedAt: 0 };
   const rows = db.prepare('SELECT * FROM local_runtime_message_rows WHERE session_id = ? ORDER BY id').all(sessionId);
   const entries = [];
+  // **我们自己写的那几轮**：DB 行带 session-sync-content 就是我们的行。
+  // 判「规范文件是不是缺了我们写的那几轮」要用它（老版本导入只写 DB 行，文件被宿主物化遮住）。
+  const ourEntries = [];
   let createdAt = 0;
   let updatedAt = 0;
   for (const r of rows) {
@@ -306,6 +306,7 @@ function readRowMessages(db, sessionId) {
         const e = toEntry({ message: { role: g.role, content: g.content }, timestamp: ts }, ts);
         if (!e) continue;
         entries.push({ ...e, ts });
+        ourEntries.push({ ...e, ts });
         pushed++;
       }
       if (pushed) continue;
@@ -326,7 +327,60 @@ function readRowMessages(db, sessionId) {
     if (items.length === 0) items.push(metaItem('msg_type', d.msg_type ?? null, ts));
     entries.push({ role, ts, items });
   }
-  return { entries, createdAt, updatedAt };
+  return { entries, ourEntries, createdAt, updatedAt };
+}
+
+/**
+ * 正文取数（list 与 read 共用这一处口径 —— 两个数必须一样）。
+ *
+ * 文件优先（照宿主自己的取数链：messages.jsonl → 账本快照 → DB 行 → blob），
+ * **但文件不完整时以 DB 行为准**：
+ *
+ * 真机症状（2026-11-23）：老版本导入 minimax 时只写 DB 行、不写规范历史文件，
+ * 宿主首次物化会话时只发布一个**空文件** —— 空文件就是模型上下文的唯一来源，
+ * 于是导入正文在模型上下文里消失（界面消息列表仍看得到，它读 DB 行）。
+ * 本机现场：4 条会话的规范文件少了 1–64 轮导入正文（其中一条少了整整 64 轮）。
+ *
+ * 判据用**内容**而不是 turn_id：宿主可能用自己的 turn_id 把我们的行重新物化进文件
+ * （内容一样、id 不同），那种情况文件是完整的；只有内容真的不在文件里才算不完整。
+ * 判据只认「我们自己写的那几轮」（DB 行带 session-sync-content 的），
+ * 宿主自己写的内容一个字都不影响取数选择。
+ */
+function pickBody(db, row, dir) {
+  const v2 = dir ? readV2Messages(dir) : null;
+  const rows = readRowMessages(db, row.session_id);
+  const fileEntries = v2?.entries ?? [];
+  if (!fileEntries.length) {
+    // 文件是空的（宿主物化出来的空文件）：有我们写的行就说明正文被遮住了
+    return { entries: rows.entries, storage: 'message-rows', v2, rows, fileIncomplete: rows.ourEntries.length > 0 };
+  }
+  if (!rows.ourEntries.length) return { entries: fileEntries, storage: 'v2-files', v2, rows, fileIncomplete: false };
+  const fileFp = new Set(assembleTurns(fileEntries).map(turnCoreFingerprint));
+  const missing = assembleTurns(rows.ourEntries).some((t) => !fileFp.has(turnCoreFingerprint(t)));
+  if (missing) return { entries: rows.entries, storage: 'message-rows', v2, rows, fileIncomplete: true };
+  return { entries: fileEntries, storage: 'v2-files', v2, rows, fileIncomplete: false };
+}
+
+/**
+ * 我们自己写的那几轮里，**文件里还没有**的那些（以 IR 轮次给出，按时间顺序）。
+ *
+ * 判据用**内容**（核心指纹）而不是 turn_id：宿主可能用自己的 turn_id 把我们的行
+ * 重新物化进文件（内容一样、id 不同）—— 那种情况文件是完整的，
+ * 按 id 判会把同一轮再补一遍，文件里就出现两次同样的内容。
+ *
+ * 写侧（`src/writers/minimax.mjs` 的自愈）用它决定「往文件里补哪几轮」。
+ *
+ * @param db 已打开的 minimax 库
+ * @param sessionId 会话 id
+ * @param dir 规范历史目录（可为 null —— 没有文件就等于全缺）
+ * @returns {Array<object>} 缺失轮次的 IR（可直接交给写侧的 IR → 文件行转换）
+ */
+export function missingImportedTurns(db, sessionId, dir) {
+  const rows = readRowMessages(db, sessionId);
+  if (!rows.ourEntries.length) return [];
+  const v2 = dir ? readV2Messages(dir) : null;
+  const fileFp = new Set(assembleTurns(v2?.entries ?? []).map(turnCoreFingerprint));
+  return assembleTurns(rows.ourEntries).filter((t) => !fileFp.has(turnCoreFingerprint(t)));
 }
 
 function isGenericTitle(t) {
@@ -365,9 +419,12 @@ export const minimaxReader = {
       for (const row of rows) {
         const rel = row.history_relative_dir;
         const dir = rel ? path.join(root, rel) : null;
-        const v2 = dir ? readV2Messages(dir, { sample: 256 * 1024 }) : null;
-        const fallback = v2 && v2.entries.length ? null : readRowMessages(db, row.session_id);
-        const entries = v2?.entries?.length ? v2.entries : fallback.entries;
+        // 轮次口径必须与 read **完全一致**（m53 棘轮）：list 这里**不采样**。
+        // 采样得到的是近似值，而 read 读的是全量 —— 同一个会话两个数，
+        // 用户按 list 挑会话、按 0 轮过滤，看到的都是错的。
+        // 同源同算法：同一份 entries、同一套 assembleTurns 口径，list.turns 必然等于 read 的轮次。
+        const body = pickBody(db, row, dir);
+        const entries = body.entries;
         const preview = previewOf(entries);
         const { cwd, scope, internalPath } = workspaceOf(row, kinds);
         out.push({
@@ -381,8 +438,8 @@ export const minimaxReader = {
           internalPath,
           createdAt: toMs(row.created_at_ms) || v2?.createdAt || 0,
           updatedAt: fileMtime(dir ?? file) || toMs(row.updated_at_ms) || v2?.updatedAt || 0,
-          turns: entries.filter((e) => e.role === 'user').length,
-          turnsApprox: !!v2?.sampled,
+          turns: assembleTurns(entries).length,
+          turnsApprox: false,
           model: safeJson(row.record_json, null)?.model ?? null,
           provenance: provenanceOf(row) || (dir ? readSidecarProvenance(path.join(dir, 'messages.jsonl')) : null),
           sourcePath: dir ?? file,
@@ -407,9 +464,10 @@ export const minimaxReader = {
 
       const root = historyRoot(ctx);
       const dir = row.history_relative_dir ? path.join(root, row.history_relative_dir) : null;
-      const v2 = dir ? readV2Messages(dir) : null;
-      const fallback = v2 && v2.entries.length ? null : readRowMessages(db, row.session_id);
-      const entries = v2?.entries?.length ? v2.entries : fallback.entries;
+      // 取数口径与 list 完全一致（同一处 pickBody）—— 两个数必须一样
+      const body = pickBody(db, row, dir);
+      const entries = body.entries;
+      const v2 = body.v2;
 
       const turns = assembleTurns(entries);
       const prov = provenanceOf(row) || (dir ? readSidecarProvenance(path.join(dir, 'messages.jsonl')) : null);
@@ -430,7 +488,9 @@ export const minimaxReader = {
           agent: row.agent_name ?? null,
           parentId: row.parent_session_id ?? null,
           sessionKind: row.session_kind ?? null,
-          storage: v2?.entries?.length ? 'v2-files' : 'message-rows',
+          storage: body.storage,
+          // 文件不完整（缺了我们自己写的那几轮）时正文取自 DB 行 —— 如实标出来
+          fileIncomplete: body.fileIncomplete,
         },
       });
       applyProvenanceToIR(session, prov);

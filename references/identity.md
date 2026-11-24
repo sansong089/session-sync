@@ -128,10 +128,17 @@ originKey = "<origin.variant>:<origin.sessionId>"
 | 某候选是源的**严格前缀** | `append` 到**最长**的那个候选（fork 也能被续写，不新开分支） |
 | 源是某候选的前缀 | `skip(target-ahead)` |
 | 都不成立（真分叉） | 相对 LCP 最长的候选 `fork`，fork ID 用该候选本地 ID 作父 |
-| 没有任何活跃候选 | 派生 ID 不存在 ⇒ `create`；存在且同身份：目标已归档 ⇒ `skip(target-archived)`，源与目标是同一条会话（round-trip）⇒ `skip(round-trip-self)`；存在但身份不同 ⇒ `fork` + `identity-mismatch` |
+| 没有任何活跃候选 | 派生 ID 不存在 ⇒ `create`；存在且同身份：目标已归档 ⇒ `skip(target-archived)`，源与目标是同一条会话（round-trip）⇒ `skip(round-trip-self)`；存在但**身份旁证丢失** ⇒ 见下「身份旁证丢失时」；身份不同 ⇒ `fork` + `identity-mismatch` |
 
 身份：`originKey(S) === originKey(T)`。目标原生时 root 就是它自己 `variant:id`；导入会话 root 取
 `provenance.origin`。身份不同 ⇒ 绝不 append/skip：两条内容相同但不同 root 的原生会话不得合并。
+
+**身份旁证丢失时**（来源标记被宿主抹掉 / 老版本导入没写标记；`src/import.mjs` 的
+`decideWithoutIdentity`）：派生 ID 是按 `originKey` 确定性派生的（宿主原生 ID 不会撞上），
+所以「这个位置原本就是这条源的导入位」仍然成立 —— 标记只是「内容同宗」的旁证。
+此时只允许**不动作**的结论：内容完全一致 ⇒ `skip(identical)`；目标是源的超集 ⇒ `skip(target-ahead)`；
+凡是**要往目标里写**的（目标是源的严格前缀 ⇒ append、双方分叉 ⇒ fork）一律 `fork` + `identity-mismatch`
+—— 宁可长副本，也不写进身份不明的会话。归档行只作存在性判定（D1）：哪怕内容一模一样也得另导一条新的。
 
 ### 4.3 原生会话的续写
 

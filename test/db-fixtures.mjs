@@ -53,4 +53,11 @@ export const mkMinimaxDb = (file) => mk(file, [
   // fixture 少了这两个索引时，「重复项目行」这类缺陷在测试里根本看不见。
   `CREATE UNIQUE INDEX idx_local_runtime_projects_workspace_v1 ON local_runtime_projects(workspace_dir) WHERE project_kind = 'workspace'`,
   `CREATE UNIQUE INDEX idx_local_runtime_projects_one_default_v1 ON local_runtime_projects(project_kind) WHERE project_kind = 'default'`,
+  // 宿主的标题搜索文档：FTS5 虚表 + rowid 登记表（app.asar repo/search.js 的
+  // writeSessionSearchDocument）。**写侧不预写** —— 宿主在会话首次被打开时自己写，
+  // 且 FTS 文档的 rowid 必须与 keys 表的 AUTOINCREMENT 分配同步，预写会占掉宿主
+  // 下一次要用的 rowid。fixture 保留这两张表是为了让 schema 与真机一致。
+  `CREATE TABLE local_runtime_session_fts_keys (fts_rowid INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL)`,
+  `CREATE UNIQUE INDEX local_runtime_session_fts_keys_session_id ON local_runtime_session_fts_keys(session_id)`,
+  `CREATE VIRTUAL TABLE local_runtime_sessions_fts USING fts5(session_id UNINDEXED, session_id_terms, agent_name_terms, title_terms, workspace_dir_terms, purpose_terms, status_terms, session_type_terms, tokenize = 'unicode61')`,
 ]);

@@ -197,7 +197,7 @@ WorkBuddy 的 `transport`/`unread`/`thought_level` 就不在 baseline 里 ——
 | qoder-cn / qoder-intl | CLI 明文 jsonl 的专用行；桌面库行的 `extra["session-sync"]` 用于给没带标记的明文副本补齐 |
 | zcode | `session_entry` 表 `type='session-sync/provenance'`（`data` 就是本体） |
 | mimo | `session.permission` 的 `"session-sync"` 键 |
-| minimax | `extra_data_json["session-sync"]` |
+| minimax | `extra_data_json["session-sync"]` + 规范历史目录里的 sidecar（`messages.jsonl.session-sync.json`）—— 宿主首次物化会话时会用自己的默认值重写 `extra_data_json`、把来源标记槽整个抹掉，sidecar 是活过那次重写的那一份 |
 | dsh | 会话目录下 `provenance.session-sync.json` |
 | freebuff | `chat-meta.json` 的 `"session-sync"` 键 |
 | cline | manifest 的 `metadata["session-sync"]`（读侧两处都认） |
@@ -272,6 +272,25 @@ WorkBuddy 的 `transport`/`unread`/`thought_level` 就不在 baseline 里 ——
   `{path, lastOpened}` 按 `path` 去重置顶、上限 10 条、2 空格 JSON；新增条目报
   `project-registered`，目录不存在时不造假条目、告警 `project-unmatched`。
   skip 自愈通道（`ensureIndex`）同样补登记 —— 历史导入复跑即可补齐。
+- minimax **导入会话的 `session_type` 必须写 `'branch'`**（`src/writers/minimax.mjs` 的 `LISTABLE`）：
+  宿主自己创建的普通对话全是 branch；`'root'` 是 Agent 的**内部主会话**（Main），
+  宿主侧栏的 `listInternalDefaultRootIds` 会把「root + conversation + 默认桶（或 Agent 内部默认工作目录）」
+  的行从侧栏整体排除 ⇒ 写 `root` 的导入会话**在桌面侧栏整条看不见**（库里有、运行时 `list` 得到、
+  侧栏没有；六个列表硬门全过也没用）。
+  真机验收 2026-11-23：改成 branch 后侧栏立刻出现。
+  skip 自愈通道（`ensureIndex`）会把老版本写出的 `root` 改回 `branch` —— 只修带
+  `session-sync` provenance 的行，宿主原生行不动。
+- minimax **导入会话必须自己落「规范历史文件」**（`src/writers/minimax.mjs` 的 `writeCanonicalHistory`）：
+  目录 = `v2/sessions/<YYYY/MM/DD/HH-mm-ss-mmm-session_<base64url(sessionId)>`（UTC，4 段斜杠，
+  与宿主 `utcSessionHistoryRelativeDir` 同形），内容 = `messages.jsonl`（宿主规范信封
+  `{message_id, turn_id, message}`）+ `manifest.json`（宿主校验它与行的 sessionId / createdAtMs 一致），
+  行的 `history_relative_dir` 直接指过去。
+  **不落的后果**：宿主物化器在会话没有 legacy 账本时只发布**空文件**，空文件就是模型上下文的
+  唯一来源 ⇒ 导入正文在模型上下文里消失（界面消息列表仍看得到，因为它读 DB 行）。
+  落盘失败才退回「只写 DB 行 + 该列留 NULL」（老行为），并在报告里告警。
+- minimax **标题搜索文档不预写**：FTS 文档（`local_runtime_sessions_fts`）由宿主在会话首次被
+  打开/物化时自己写，写侧预写会占掉宿主下一次分配的 FTS rowid（与
+  `local_runtime_session_fts_keys` 的 AUTOINCREMENT 分配必须同步），宿主再建会话就会撞唯一约束。
 - minimax **一行 = 一条消息**（宿主的 display message 契约，见 [`agent-storage.md`](agent-storage.md) minimax V6）：
   一轮 IR 按**模型发言**切成若干帧（一帧 = 一段思考 + 若干 (工具调用 + 工具回执) + 可选正文），
   收到工具回执或出现正文即断帧；同一轮里连续的 user 文本块算一条消息（Anthropic 存多块）。
@@ -286,6 +305,33 @@ WorkBuddy 的 `transport`/`unread`/`thought_level` 就不在 baseline 里 ——
   工具回执写成**独立的 `role='toolResult'` 行**（`toolCallId` / `toolName` / `content[]` / `isError`）。
   不许把 π 块（`tool_use` / `tool_result`）写进这个文件 —— 宿主不认这两个块类型，它自己界面里
   那次调用会只剩「发起」没有「结果」。DB 行路径不受此约束：那条路走的是 `tool_calls[]` 原生列。
+- minimax **列表的轮次必须与 read 同口径**（`src/readers/minimax.mjs`）：不采样、不标近似 ——
+  `list` 与 `read` 读同一份 `messages.jsonl`、用同一套 `assembleTurns` 口径算轮次。
+  早先 `list` 走采样（大文件只读头尾），同一个会话 `list` 报 1 轮、`read` 报 67 轮 ——
+  用户按 `list` 挑会话、按 0 轮过滤，看到的都是错的数。
+- minimax **规范文件与 DB 行分叉时，读侧以 DB 行为准**（`src/readers/minimax.mjs` 的 `pickBody`）：
+  文件优先（照宿主取数链），但**我们写的那几轮在文件里没有**时改用 DB 行 ——
+  宿主物化出来的空文件会把导入正文整个遮住（界面消息列表仍看得到，因为它读 DB 行）。
+  判据按**内容**（核心指纹）而不是 turn_id：宿主可能用自己的 turn_id 把我们的行重新物化进文件，
+  那种情况文件是完整的，按 id 判会把同一轮当成缺失。
+- minimax **规范历史文件自愈**（`src/writers/minimax.mjs` 的 `repair`，走 writer 的目标级自愈钩子，
+  锁内、决策之前跑）：把「我们写的那几轮里文件还没有的」按时间戳归并回文件 ——
+  宿主自己写的内容**逐字节保留**（按原始行文本归并，不重新序列化）。
+  写前校验文件 size 与 mtime：宿主刚追加过就**放弃这次修复**（不覆盖），下次重跑再试。
+  为什么要赶在决策之前：文件被遮住时，读侧看到的会话只有宿主自己的那几轮，
+  内容对不上源 → 判成分叉 → 长出重复副本。
+- **身份旁证丢失时的决策底线**（`src/import.mjs` 的 `decideWithoutIdentity`）：
+  来源标记被宿主抹掉 / 老版本导入没写标记时，只允许「已经在那儿」的结论
+  （内容完全一致 → identical；目标是源的超集 → target-ahead），两者都是**不动作**；
+  凡是**要往目标里写**的（目标是源的严格前缀 → append、双方分叉 → fork）一律判
+  `fork + identity-mismatch` —— 宁可长副本，也不写进身份不明的会话（m4 的底线）。
+  归档行只作存在性判定（D1）：哪怕内容一模一样也得另导一条新的（m28）。
+  完整表述见 [`identity.md`](identity.md) §4.2。
+- minimax **文件形态里的压缩摘要要补回标签壳**：原生块只有 `type` / `text`，没有压缩语义位，
+  判据只能落在**内容**上 —— 写侧给带压缩语义位的文本块补回 `<cb_summary>` 壳
+  （与 DB 行 `msg_content` 同一口径），读侧据此还原语义位、剥壳取裸正文。
+  不补壳的话，摘要经文件载体往返后退化成普通用户提问，语义位与正文一起丢
+  （DB 行载体不受影响：那里靠 `msg_type=3` 与 `session-sync-content` 承载）。
 - minimax 的落点目录必须**对齐到宿主已有的项目行**（`src/writers/minimax.mjs` 的
   `resolveWorkspaceDir` / `mergeDuplicateProjects`）：宿主的项目键是字节级目录串
   （`local_runtime_projects.workspace_dir` 上的部分唯一索引 + 触发器回填 `project_id` 时的等值比较），

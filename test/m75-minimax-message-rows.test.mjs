@@ -19,6 +19,7 @@ import { makeCtx } from '../src/hosts.mjs';
 import { mkMinimaxDb } from './db-fixtures.mjs';
 import { planImport, executePlan } from '../src/import.mjs';
 import { readSession } from '../src/readers/index.mjs';
+import { getWriter } from '../src/writers/index.mjs';
 import { sessionCoreFingerprints } from '../src/ir.mjs';
 
 const WB_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -63,9 +64,12 @@ function mkWorkbuddySource(root, { cwd = 'C:/work/wb' } = {}) {
     { id: 'f1', parentId: 'r1', timestamp: 1790422881174, type: 'function_call', callId: 'call_00_a', name: 'Bash', arguments: '{"command":"ls"}' },
     { id: 'fr1', parentId: 'f1', timestamp: 1790422882640, type: 'function_call_result', name: 'Bash', callId: 'call_00_a', status: 'completed', output: { type: 'text', text: 'a.txt' } },
     { id: 'm2', parentId: 'fr1', timestamp: 1790422943324, type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '已完成' }] },
-    // 宿主注入的压缩摘要：role=user，但内容是 <cb_summary> 包裹的摘要，不是用户提问
+    // 宿主注入的压缩摘要：role=user，但内容是 <cb_summary> 包裹的摘要，不是用户提问。
+    // 时间戳照真机形态：摘要行是**事后补的**，时间戳比下一条消息还晚
+    // （真机：摘要 ts=1795401561394，下一条消息 ts=1795401558260）——
+    // 所以按时间戳整体排序会把摘要轮与下一轮对调，轮次顺序就乱了。
     {
-      id: 'm3', parentId: 'm2', timestamp: 1790422950000, type: 'message', role: 'user',
+      id: 'm3', parentId: 'm2', timestamp: 1790422965000, type: 'message', role: 'user',
       content: [{ type: 'input_text', text: '<cb_summary>\nSummary of the conversation so far:\n重写笔记 → 已完成\n</cb_summary>' }],
       providerData: { isCompacted: true, isCompactInternal: true, compactionKind: 'auto' },
     },
@@ -212,6 +216,32 @@ test('循环导入导出稳定：workbuddy → minimax → workbuddy → minimax
   assert.ok(again, '二次导入必须成功');
   assert.notEqual(again.action, 'fork', `循环导入不得判成分叉，实际 ${again.action}（${again.reason ?? ''}）`);
   assert.equal(again.action, 'skip', `内容未变时必须判 skip，实际 ${again.action}/${again.reason ?? ''}`);
+});
+
+test('规范文件自愈：补回的轮次顺序必须与源一致（摘要轮的时间戳偏前也不能被调换）', () => {
+  const root = tmpHome('heal-order');
+  const file = mkMinimaxDbAt(root);
+  mkWorkbuddySource(root);
+  const ctx = ctxFor(root);
+  const res = importWBtoMM(ctx).find((r) => r.ok);
+  const id = res.targetId;
+
+  // 宿主物化出空文件 → 导入正文被遮住（真机症状）
+  const db = new DatabaseSync(file);
+  const rel = db.prepare('SELECT history_relative_dir FROM local_runtime_sessions WHERE session_id = ?').get(id).history_relative_dir;
+  db.close();
+  const histFile = path.join(root, '.minimax', 'v2', 'sessions', ...String(rel).split('/'), 'messages.jsonl');
+  fs.writeFileSync(histFile, '', 'utf8');
+
+  // 写侧自愈把轮次补回文件
+  const rep = getWriter('minimax').repair(ctx);
+  assert.equal(rep.ok, true, JSON.stringify(rep));
+
+  // 逐轮指纹必须与源一致：源里「压缩摘要」那一轮的时间戳偏前，
+  // 按时间戳整体排序会把摘要轮与下一轮对调 —— 指纹从那一轮起整体错位。
+  const src = readSession('workbuddy-cn', ctx, WB_ID).session;
+  const back = readSession('minimax', ctx, id).session;
+  assert.deepEqual(sessionCoreFingerprints(back), sessionCoreFingerprints(src), '补回后的轮次必须与源逐轮一致（顺序不能乱）');
 });
 
 test('宿主原生行（source=api）读回时工具名/入参/结果不丢', () => {

@@ -19,13 +19,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { VARIANTS, configRoot } from '../hosts.mjs';
-import { tableExists, tableColumns } from '../readers/base.mjs';
+import { tableExists, tableColumns, safeJson } from '../readers/base.mjs';
 import { ensureDir, isFile, cmpPath, canonicalDirPath } from '../util.mjs';
 import { writeRootOf, roleRoots } from '../roots.mjs';
 import { makeTitleSyncer } from './title-slots.mjs';
-import { insertRowFiltered, newNodeId, updateRowFiltered, appendFileAtomic } from './base.mjs';
+import { writeSidecarProvenance } from '../provenance.mjs';
+import { insertRowFiltered, newNodeId, updateRowFiltered, appendFileAtomic, writeFileAtomic } from './base.mjs';
 import { firstExisting } from '../readers/base.mjs';
 import { toNativeBlock, toolResultRowOfBlock } from '../pi-agent-blocks.mjs';
+import { missingImportedTurns } from '../readers/minimax.mjs';
 import { fitTitleFor, TITLE_MAX } from '../titles.mjs';
 import { compactionInjectionKind } from '../text.mjs';
 
@@ -41,7 +43,7 @@ const p3 = (n) => String(n).padStart(3, '0');
 // 只写 DB 行会被文件遮蔽（真机实测：append 返回成功但读回轮次不变）。
 function historyFileOf(ctx, db, targetId) {
   // 历史根按 role 取（声明层已登记 MINIMAX_HOME）：根被搬走时写侧跟着走
-  const root = writeRootOf('minimax', ctx, 'history')?.path ?? path.join(configRoot(ctx, 'minimax'), 'v2', 'sessions');
+  const root = historyRootOf(ctx);
   if (!tableColumns(db, 'local_runtime_sessions').includes('history_relative_dir')) return null;
   const rel = db.prepare('SELECT history_relative_dir AS rel FROM local_runtime_sessions WHERE session_id = ?').get(targetId)?.rel;
   if (!rel) return null;
@@ -118,21 +120,123 @@ function frameToHistoryLines(frame, turnId, ts) {
   const lines = [];
   const push = (role, message) =>
     lines.push({ message_id: `msg-${role}-v1-${newNodeId()}`, turn_id: turnId, message: { ...message, timestamp: ts } });
-  const nativeBlocks = blocks.map((b) => toNativeBlock(b)).filter(Boolean);
+  const nativeBlocks = [];
+  for (const b of blocks) {
+    const nb = toNativeBlock(b);
+    if (!nb) continue;
+    // 压缩摘要在文件形态里没有 compact 位（原生块只有 type/text），判据只能落在**内容**上：
+    // 补回 <cb_summary> 壳（与 DB 行 msg_content 同一口径），读侧据此还原 compact 语义位、
+    // 剥壳取裸正文 —— 否则文件路径读回的摘要退化成普通用户提问，正文与语义一起丢。
+    if (nb.type === 'text' && b.compact === true && !compactionInjectionKind(nb.text)) {
+      nb.text = `<cb_summary>${nb.text}</cb_summary>`;
+    }
+    nativeBlocks.push(nb);
+  }
   if (nativeBlocks.length) push(frame.role, { role: frame.role, content: nativeBlocks });
   for (const r of results) push('toolResult', toolResultRowOfBlock(r));
   return lines;
 }
 
 /**
- * 宿主的历史目录相对路径，纯函数（实测 4/4 可由 (session_id, created_at_ms) 还原）：
- *   `2026-09-08/05-47-43-992-session_<base64url(sessionId)>`
- * 我们只写 DB、把该列留 NULL，物化交给宿主；这个函数只用于「宿主会把它放哪」的提示与校验。
+ * 宿主的历史目录相对路径（app.asar `session-history-paths.js` 的
+ * `utcSessionHistoryRelativeDir` 原文）：`YYYY/MM/DD/HH-mm-ss-mmm-session_<base64url(sessionId)>`。
+ *
+ * 三条硬约束（宿主 `validateRelativeDir` 会拒）：
+ *   ① **4 段斜杠**（年 / 月 / 日 / 时间-会话名）—— 早先写成 `YYYY-MM-DD/...` 是两段，宿主认不出；
+ *   ② 不含反斜杠、不绝对；
+ *   ③ 时间戳取 **UTC**（宿主自己的派生也是 UTC）。
+ * 库里的 `history_relative_dir` 就是这个值，磁盘路径 = `<v2/sessions>/<该值>`。
  */
 export function historyRelativeDir(sessionId, createdAtMs) {
   const d = new Date(Number(createdAtMs) || 0);
-  const stamp = `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}/${p2(d.getUTCHours())}-${p2(d.getUTCMinutes())}-${p2(d.getUTCSeconds())}-${p3(d.getUTCMilliseconds())}`;
-  return `${stamp}-session_${Buffer.from(String(sessionId), 'utf8').toString('base64url')}`;
+  const date = `${String(d.getUTCFullYear()).padStart(4, '0')}/${p2(d.getUTCMonth() + 1)}/${p2(d.getUTCDate())}`;
+  const time = `${p2(d.getUTCHours())}-${p2(d.getUTCMinutes())}-${p2(d.getUTCSeconds())}-${p3(d.getUTCMilliseconds())}`;
+  const encoded = Buffer.from(String(sessionId), 'utf8').toString('base64url').slice(0, 180);
+  return `${date}/${time}-session_${encoded}`;
+}
+
+/** 宿主规范历史的根目录（正文目录树） */
+function historyRootOf(ctx) {
+  return writeRootOf('minimax', ctx, 'history')?.path ?? path.join(configRoot(ctx, 'minimax'), 'v2', 'sessions');
+}
+
+/**
+ * provenance 的**第二落点**：规范历史目录里的 sidecar。
+ *
+ * 为什么必须写（真机 2026-11-23）：宿主首次物化会话时用自己的一套默认值重写
+ * `extra_data_json`，**来源标记槽被整个抹掉**。只靠那一列的话，第二次导入读回这条会话
+ * 就认不出它属于哪个 origin → 判成「不同身份」→ 长出一条重复副本（真机：重跑导入多出
+ * 一条 1307 行的 fork）。
+ *
+ * sidecar 是宿主不碰的文件（`messages.jsonl.session-sync.json` 不匹配宿主任何扫描规则），
+ * 标记因此能活过宿主的重写；读侧本来就会在 extra_data_json 之后读它（兜底口径）。
+ *
+ * 注意：这只解决「标记丢了」，不解决「身份判定」—— 标记**整条**没有（连 sidecar 也没了）
+ * 的同 id 行仍然按不同身份处理（fork + identity-mismatch），那是 m4 钉住的既有契约。
+ *
+ * @returns {string|null} sidecar 路径；失败返回 null（不阻断写入）
+ */
+function writeProvenanceSidecar(dir, provenance) {
+  if (!dir || !provenance) return null;
+  try {
+    return writeSidecarProvenance(path.join(dir, 'messages.jsonl'), provenance);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 自己落一份宿主的**规范历史文件**（新建会话时）。
+ *
+ * 为什么必须自己写（真机 2026-11-23）：
+ *   宿主的物化器（`canonical-history-materializer`）在会话**没有 legacy 账本**时
+ *   只会 `publishInitial(paths.messages, [])` —— 发布一个**空文件**，它不会从
+ *   `local_runtime_message_rows` 回填。空文件一旦存在，它就是正文的首选源
+ *   （读数链：messages.jsonl → 账本快照 → DB 行 → blob），
+ *   把我们写进 DB 行的导入正文整个遮住 ⇒ 界面上只看得见宿主自己的新回合。
+ *   反过来，物化器只在目标**不存在**时才发布空文件 ⇒ 我们先把规范文件写好，
+ *   宿主就不会覆盖它，后续回合直接追加在后面（这正是 append 路径已有的做法）。
+ *
+ * 文件形态照宿主真机：`{message_id, turn_id, message}` 一行一条消息；
+ * 同目录还要有 `manifest.json`（宿主校验它与行的 sessionId / createdAtMs 一致）。
+ *
+ * @returns {{ok:boolean, relativeDir?:string, dir?:string, error?:string}}
+ */
+function writeCanonicalHistory(ctx, { sessionId, createdAtMs, updatedAtMs, lines }) {
+  const relativeDir = historyRelativeDir(sessionId, createdAtMs);
+  const root = historyRootOf(ctx);
+  const dir = path.join(root, ...relativeDir.split('/'));
+  try {
+    ensureDir(dir);
+    // 原子写：先写临时文件再改名 —— 宿主随时可能在读这个文件，半截 JSON 行会毁掉整份历史
+    const messages = path.join(dir, 'messages.jsonl');
+    const tmpMessages = `${messages}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpMessages, lines.length ? `${lines.map((l) => JSON.stringify(l)).join('\n')}\n` : '', 'utf8');
+    fs.renameSync(tmpMessages, messages);
+    const manifest = {
+      schemaVersion: 1,
+      sessionId: String(sessionId),
+      createdAtMs: Number(createdAtMs),
+      updatedAtMs: Number(updatedAtMs),
+      source: 'local-runtime',
+      layout: 'v2-final-dated-session',
+      paths: {
+        sessionDir: dir,
+        ledger: path.join(dir, 'ledger.jsonl'),
+        display: path.join(dir, 'display.jsonl'),
+        snapshot: path.join(dir, 'snapshot.json'),
+        reports: path.join(dir, 'reports'),
+        messages,
+      },
+    };
+    const manifestPath = path.join(dir, 'manifest.json');
+    const tmpManifest = `${manifestPath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpManifest, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    fs.renameSync(tmpManifest, manifestPath);
+    return { ok: true, relativeDir, dir };
+  } catch (err) {
+    return { ok: false, relativeDir, dir, error: `canonical-history-write-failed: ${String(err?.message ?? err)}` };
+  }
 }
 
 // IR item → π content 块（宿主 messages.jsonl 用的块结构）。
@@ -258,11 +362,26 @@ const LISTABLE = {
   columnar_version: 3,
   agent_name: 'mavis',
   runtime: 'pi-agent',
-  session_type: 'root',
+  // session_type 必须是 'branch'（真机取证 2026-11-23）：
+  //   宿主自己创建的普通对话全是 'branch'；'root' 是 Agent 的 Main 会话（内部主会话）。
+  //   写成 'root' 会踩宿主侧栏的**内部主会话排除规则**（listInternalDefaultRootIds）：
+  //   session_type='root' AND session_kind='conversation' 且 is_default_workspace=1
+  //   ⇒ 被当成 Agent 内部 Main 会话，从侧栏 eligible 集合里排除 ⇒ 整条会话在桌面侧栏看不见。
+  //   真机症状：导入的会话库里有、运行时 list 得到，桌面侧栏没有。
+  session_type: 'branch',
   status: 'idle',
   visibility: 'visible',
   session_kind: 'conversation',
 };
+
+// 标题搜索文档（`local_runtime_sessions_fts`）**不由写侧预写**，交给宿主：
+//   宿主在会话首次被打开/物化时自己写这份搜索文档（app.asar repo/search.js 的
+//   writeSessionSearchDocument），并且 FTS 文档的 rowid 必须与
+//   `local_runtime_session_fts_keys.fts_rowid` 一一对应 —— 那张表是 AUTOINCREMENT，
+//   宿主按它分配 rowid 给新会话。写侧预写会占掉宿主下一次要用的 rowid，
+//   宿主再建会话时就会撞 FTS 的 rowid 唯一约束（比「搜不到」严重得多）。
+//   代价：会话在被打开之前搜不到（宿主自己补上后就能搜）。
+
 
 /**
  * 盘上已有的标题：先看 title 列（宿主列表读它），列空再退回 record_json 快照。
@@ -315,6 +434,141 @@ function ensureProjectRow(db, { workspace, isDefault, createdAt, updatedAt }) {
     return find() ?? (Number(info.changes) > 0 ? Number(info.lastInsertRowid) : null);
   } catch {
     return null;
+  }
+}
+
+/**
+ * 规范历史文件现状：原始行文本 + 每行的 turn_id / 时间戳 + 文件的 size/mtime。
+ *
+ * 保留**原始行文本**（不重新序列化）：宿主自己写的那些行必须逐字节不变 ——
+ * 我们只往里补内容，不重排、不改写宿主写过的任何一行。
+ */
+function readHistoryFileState(file) {
+  const out = { exists: false, size: 0, mtimeMs: 0, turnIds: new Set(), lines: [] };
+  let text;
+  try {
+    const st = fs.statSync(file);
+    out.exists = true;
+    out.size = st.size;
+    out.mtimeMs = st.mtimeMs;
+    text = fs.readFileSync(file, 'utf8');
+  } catch {
+    return out;
+  }
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let ts = 0;
+    try {
+      const o = JSON.parse(line);
+      if (o?.turn_id) out.turnIds.add(String(o.turn_id));
+      ts = Number(o?.message?.timestamp) || 0;
+    } catch {
+      /* 坏行原样保留，不参与解析 */
+    }
+    // 时间戳缺失的行不参与排序（排到末尾）：它们的真实位置无从得知，
+    // 让它们留在末尾比按 0 排到最前面更安全。
+    out.lines.push({ ts: ts || Number.MAX_SAFE_INTEGER, text: line });
+  }
+  return out;
+}
+
+/** 我们自己的 DB 行按 turn_id 分组（保持首次出现的顺序 = 时间顺序） */
+function groupOurTurns(rows) {
+  const map = new Map();
+  for (const r of rows) {
+    const key = String(r.turn_id ?? '');
+    if (!key) continue;
+    const g = map.get(key) ?? { turnId: key, rows: [] };
+    g.rows.push(r);
+    map.set(key, g);
+  }
+  return [...map.values()];
+}
+
+/**
+ * 规范历史文件自愈：把我们自己写的那几轮补回文件。
+ *
+ * 背景（真机 2026-11-23）：老版本导入 minimax 时只写 DB 行、不写规范历史文件 ——
+ * 宿主首次物化会话时只发布一个**空文件**，空文件就是模型上下文的唯一来源，
+ * 于是导入正文在模型上下文里消失（界面消息列表仍看得到，它读 DB 行）。
+ * 本机现场：4 条会话的规范文件少了 1–64 轮导入正文（其中一条少了整整 64 轮）。
+ *
+ * 判据与补写内容都问读侧（`missingImportedTurns`）：**按内容**（核心指纹）判缺哪几轮 ——
+ * 宿主可能用自己的 turn_id 把我们的行重新物化进文件（内容一样、id 不同），
+ * 按 id 判会把同一轮再补一遍，文件里就出现两次同样的内容。
+ *
+ * 只补我们自己的轮次；宿主自己写的内容**逐字节保留**（按原始行文本归并）。
+ *
+ * 并发：宿主随时可能在追加这个文件 —— 写前校验 size 与 mtime，对不上就**放弃这次修复**
+ * （不覆盖宿主的追加），下次重跑再试。宁可晚点补上，也不吃掉宿主刚写的轮次。
+ */
+function repairCanonicalHistories(ctx) {
+  const warnings = [];
+  const file = dbFile(ctx);
+  if (!file || !isFile(file)) return { ok: false, error: 'db-not-found', warnings };
+  const db = new DatabaseSync(file, { readOnly: true });
+  const repaired = [];
+  try {
+    if (!tableExists(db, 'local_runtime_sessions') || !tableExists(db, 'local_runtime_message_rows')) {
+      return { ok: true, skipped: 'tables-absent', warnings };
+    }
+    const root = historyRootOf(ctx);
+    const sessions = db.prepare('SELECT session_id, history_relative_dir FROM local_runtime_sessions').all();
+    for (const s of sessions) {
+      if (!s.history_relative_dir) continue;
+      const dir = path.join(root, ...String(s.history_relative_dir).split('/'));
+      const histFile = path.join(dir, 'messages.jsonl');
+      const missing = missingImportedTurns(db, s.session_id, dir);
+      if (!missing.length) continue;
+
+      // 缺失轮次 → 宿主规范形状的行（与新建时同一套转换：IR → 帧 → 行）
+      const blocks = [];
+      for (const turn of missing) {
+        const ts = Number(turn.startedAt) || 0;
+        const turnId = `turn_repair_${String(newNodeId())}`;
+        const lines = [];
+        for (const frame of turnToMessageFrames(turn)) {
+          for (const l of frameToHistoryLines(frame, turnId, ts)) {
+            lines.push({ ts: ts || Number.MAX_SAFE_INTEGER, text: JSON.stringify(l) });
+          }
+        }
+        if (lines.length) blocks.push({ ts: ts || Number.MAX_SAFE_INTEGER, lines });
+      }
+      // 归并进文件：按时间戳找落点，但**我们各轮之间保持原顺序**。
+      // 为什么不能整体按时间戳排：源里的轮次顺序不是严格按时间戳的 —— 宿主注入的压缩摘要
+      // 时间戳会偏前（真机：摘要轮与下一轮被对调），一排就把两轮换了位置，
+      // 核心指纹从那一轮起整体错位 → 读回的内容与源对不上。
+      const state = readHistoryFileState(histFile);
+      const merged = [...state.lines];
+      let cursor = 0;
+      for (const block of blocks) {
+        let at = cursor;
+        while (at < merged.length && merged[at].ts <= block.ts) at++;
+        merged.splice(at, 0, ...block.lines);
+        cursor = at + block.lines.length;
+      }
+      const content = merged.length ? `${merged.map((l) => l.text).join('\n')}\n` : '';
+      try {
+        writeFileAtomic(histFile, content, state.exists ? { expectSize: state.size, expectMtimeMs: state.mtimeMs } : {});
+      } catch (err) {
+        if (err?.code === 'CONCURRENT_MODIFICATION') {
+          warnings.push(`canonical-history-repair-skipped: ${histFile}（宿主刚追加过这个文件，本次不覆盖，下次重跑再试）`);
+          continue;
+        }
+        throw err;
+      }
+      repaired.push(s.session_id);
+      warnings.push(`canonical-history-repaired: ${s.session_id} 补回 ${missing.length} 轮导入正文（${histFile}）`);
+    }
+    return { ok: true, repaired, warnings };
+  } catch (err) {
+    return { ok: false, error: `repair-failed: ${String(err?.message ?? err)}`, warnings };
+  } finally {
+    try {
+      db.close();
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -428,6 +682,17 @@ export const minimaxWriter = {
   },
 
   /**
+   * 目标级自愈（导入时、锁内、决策之前调用）：把规范历史文件里缺了的那几轮导入正文补回去。
+   *
+   * 为什么必须在决策之前：宿主物化出来的空文件会把 DB 行里的导入正文整个遮住 ——
+   * 读侧因此看到的是「只有宿主自己那几轮」的会话，内容对不上源 → 判成分叉 → 长出重复副本。
+   * 先把文件补齐，读侧与决策看到的才是同一条完整会话。
+   */
+  repair(ctx) {
+    return repairCanonicalHistories(ctx);
+  },
+
+  /**
    * 元数据漂移：源侧只改了标题（内容没变）时同步到目标。
    * minimax 的标题住在 local_runtime_sessions.title 列。
    */
@@ -457,9 +722,35 @@ export const minimaxWriter = {
       db.exec('PRAGMA busy_timeout = 8000');
       if (!tableExists(db, 'local_runtime_sessions')) return { ok: false, error: 'sessions-table-absent', warnings };
       const row = db
-        .prepare('SELECT workspace_dir, project_workspace_dir, is_default_workspace, project_id FROM local_runtime_sessions WHERE session_id = ?')
+        .prepare('SELECT workspace_dir, project_workspace_dir, is_default_workspace, project_id, session_type, extra_data_json FROM local_runtime_sessions WHERE session_id = ?')
         .get(String(targetId));
       if (!row) return { ok: false, error: 'target-missing', warnings };
+
+      // ---- 可见性自愈：老版本写进来的 session_type='root' ----
+      // 宿主把「root + conversation + 默认桶」的行当成 Agent 内部 Main 会话，
+      // 从侧栏 eligible 集合里排除（listInternalDefaultRootIds）⇒ 桌面侧栏看不见。
+      // 只修**我们自己写过的行**（extra_data_json 里有 session-sync 标记）；
+      // 宿主原生行（哪怕也是 root）一个字都不动（relocate-foreign 口径）。
+      const own = /"session-sync"\s*:/.test(String(row.extra_data_json ?? ''));
+      if (own) {
+        const sets = [];
+        if (String(row.session_type) === 'root') sets.push(['session_type', LISTABLE.session_type]);
+        if (sets.length) {
+          db.exec('BEGIN IMMEDIATE');
+          try {
+            updateRowFiltered(db, 'local_runtime_sessions', sets, { session_id: String(targetId) });
+            db.exec('COMMIT');
+            warnings.push(`visibility-healed: session_type ${row.session_type} → ${LISTABLE.session_type}（宿主侧栏的内部主会话排除规则）`);
+          } catch (err) {
+            try {
+              db.exec('ROLLBACK');
+            } catch {
+              /* ignore */
+            }
+            warnings.push(`visibility-heal-failed: ${String(err?.message ?? err)}`);
+          }
+        }
+      }
       const isDefault = Number(row.is_default_workspace) === 1 || scope === 'none';
       const want = String(cwd ?? row.workspace_dir ?? '').trim();
       if (!want || isDefault) return { ok: true, changed: false, warnings };
@@ -529,6 +820,7 @@ export const minimaxWriter = {
 
     const db = new DatabaseSync(file);
     let inserted = 0;
+    let canonicalRel = null;
     try {
       db.exec('PRAGMA busy_timeout = 8000');
       if (!tableExists(db, 'local_runtime_sessions') || !tableExists(db, 'local_runtime_message_rows')) {
@@ -581,6 +873,43 @@ export const minimaxWriter = {
       };
       const extra = provenance ? { 'session-sync': provenance } : {};
 
+      // 先把轮次转成帧（纯函数）：文件载体与 DB 行载体共用同一批帧。
+      // 一轮一个 turn_id，这一轮的所有消息共享它（宿主原生行就是这个形状）。
+      const prepared = [];
+      let turnSeq = 0;
+      for (const turn of turns) {
+        const frames = turnToMessageFrames(turn);
+        if (!frames.length) continue;
+        const turnId = `turn_${String(turnSeq).padStart(4, '0')}_${newNodeId()}`;
+        turnSeq += 1;
+        prepared.push({ frames, turnId, ts: Number(turn.startedAt) || updatedAt });
+      }
+
+      // 宿主已有 messages.jsonl → 追加写进文件（reader 首选源），不再插 DB 行避免双份
+      const histFile = mode === 'append' ? historyFileOf(ctx, db, targetId) : null;
+
+      // 新建会话：自己落一份宿主规范历史文件。
+      // 不落的后果：宿主物化器只发布**空文件**，空文件成为正文首选源 → 导入正文在界面上消失。
+      // 落盘失败则退回 DB 行载体（老行为），并把 history_relative_dir 留 NULL 交给宿主绑定。
+      if (!existing) {
+        const lines = prepared.flatMap(({ frames, turnId, ts }) => frames.flatMap((f) => frameToHistoryLines(f, turnId, ts)));
+        const ch = writeCanonicalHistory(ctx, {
+          sessionId: String(targetId),
+          createdAtMs: createdAt,
+          updatedAtMs: updatedAt,
+          lines,
+        });
+        if (ch.ok) {
+          canonicalRel = ch.relativeDir;
+          warnings.push(`canonical-history: ${ch.dir}`);
+          // 来源标记的第二个落点：宿主会重写 extra_data_json，sidecar 才是活过那次重写的那一份
+          const sc = writeProvenanceSidecar(ch.dir, provenance);
+          if (sc) warnings.push(`provenance-sidecar: ${sc}`);
+        } else {
+          warnings.push(ch.error);
+        }
+      }
+
       if (!existing) {
         // 显式列表 + 等长占位符：手写 ? 数很容易与列数错位（SQLite 只报「N values for M columns」）
         // 列名与值一一对应；按库里**实际存在**的列过滤（与 workbuddy 索引同一口径）——
@@ -609,7 +938,7 @@ export const minimaxWriter = {
           ['error_message', null],
           ['error_code', null],
           ['extra_data_json', JSON.stringify(extra)],
-          ['history_relative_dir', null],
+          ['history_relative_dir', canonicalRel],
         ];
         const ins = insertRowFiltered(db, 'local_runtime_sessions', all, { ifEmpty: 'skip' });
         if (!ins.ok || !ins.inserted) return { ok: false, error: 'local_runtime_sessions-table-absent', targetId, warnings };
@@ -633,18 +962,12 @@ export const minimaxWriter = {
         updateRowFiltered(db, 'local_runtime_sessions', sets, { session_id: String(targetId) });
       }
 
-      // 宿主已有 messages.jsonl → 追加写进文件（reader 首选源），不再插 DB 行避免双份
-      const histFile = mode === 'append' ? historyFileOf(ctx, db, targetId) : null;
+      // 正文载体：
+      //   · 新建 → **两处都写**：规范历史文件（宿主看的那份）+ DB 行（我们自己的无损副本，
+      //     带 session-sync-content 全量部件；文件里放不下这个槽）。文件是首选源，DB 行是兜底。
+      //   · 追加进已有文件 → 只写文件：文件已是首选源，再插 DB 行会双份。
       const histLines = [];
-      let turnSeq = 0;
-
-      for (const turn of turns) {
-        const frames = turnToMessageFrames(turn);
-        if (!frames.length) continue;
-        // 一轮一个 turn_id，这一轮的所有消息共享它（宿主原生行就是这个形状）
-        const turnId = `turn_${String(turnSeq).padStart(4, '0')}_${newNodeId()}`;
-        turnSeq += 1;
-        const ts = Number(turn.startedAt) || updatedAt;
+      for (const { frames, turnId, ts } of prepared) {
         if (histFile) {
           const lines = frames.flatMap((f) => frameToHistoryLines(f, turnId, ts));
           histLines.push(...lines);
@@ -664,6 +987,9 @@ export const minimaxWriter = {
         // 而这一行正是宿主下一轮的上下文输入
         appendFileAtomic(histFile, `${histLines.map((l) => JSON.stringify(l)).join('\n')}\n`);
         warnings.push(`append-history-file: ${histFile}`);
+        // 追加时同样刷新 sidecar：宿主的 extra_data_json 随时可能被重写，sidecar 是兜底那份
+        const sc = writeProvenanceSidecar(path.dirname(histFile), provenance);
+        if (sc) warnings.push(`provenance-sidecar: ${sc}`);
       }
     } catch (err) {
       try {
@@ -680,7 +1006,8 @@ export const minimaxWriter = {
       }
     }
 
-    if (isDefault) {
+    if (isDefault && !canonicalRel) {
+      // 规范历史文件没落成（宿主侧仍可物化，但正文会先被空文件遮住）：把宿主将用的目录告诉调用方
       warnings.push(`history-dir-for-host: ${historyRelativeDir(targetId, createdAt)}（该列留 NULL，由宿主物化时绑定）`);
     }
     return { ok: true, targetId, path: file, lines: inserted, mode, warnings, directory: workspace };
