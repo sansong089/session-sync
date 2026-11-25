@@ -13,6 +13,8 @@ import { planSwitch, executeSwitch } from './switch.mjs';
 import { verifyImported } from './verify.mjs';
 import { installSkill, uninstallSkill } from './installer.mjs';
 import { parseDataRoots, rootSummary, resolveRoot, detectInstalled, probeStats } from './roots.mjs';
+import { upgradeMinimaxCompaction } from './writers/minimax.mjs';
+import { acquireLock } from './lock.mjs';
 
 export const EXIT = { OK: 0, USAGE: 1, WRITE: 2, NOOP: 3 };
 
@@ -103,6 +105,7 @@ const FLAGS = {
   import: ['from', 'into', 'since', 'until', 'project', 'limit', 'id', 'include-subagents', 'include-empty', 'include-degraded', 'cwd', 'account', 'placement', 'apply', 'dry-run', 'force', 'no-lock', 'lock-timeout', 'data-root', 'trace-entry', 'allow-family-duplicate'],
   'switch-account': ['into', 'id', 'account', 'ide', 'cwd', 'keep-source', 'only-imported', 'apply', 'dry-run', 'force', 'no-lock', 'lock-timeout', 'data-root', 'trace-entry'],
   verify: ['into', 'expect', 'mode', 'strict', 'data-root', 'trace-entry'],
+  repair: ['into', 'id', 'apply', 'dry-run', 'data-root'],
   // install / uninstall 也会调 ctxFromArgs（那里读 --data-root），白名单漏了它就会
   // 「实现认这个参数、校验说它是未知参数」；uninstall 同样要 cwd —— Freebuff 的
   // 薄封装写在 <cwd>/.agents 下，不给 cwd 就删不到安装时写的那个文件
@@ -425,10 +428,11 @@ function cmdStatus(args, asJson) {
   }
 
   const plan = planImport(ctx, opts);
+  const ok = !plan.errors.length && !plan.pairs.some((pair) => pair.reason === 'target-unreadable');
   if (asJson) {
     // errors 非空却报 ok:true，会让调用方把「有源读不出来」当成一切正常
-    out({ ok: !(plan.errors ?? []).length, command: 'status', host, targets: plan.targets, summary: plan.summary, errors: plan.errors, pairs: plan.pairs }, true);
-    return EXIT.OK;
+    out({ ok, command: 'status', host, targets: plan.targets, summary: plan.summary, errors: plan.errors, pairs: plan.pairs }, true);
+    return ok ? EXIT.OK : EXIT.USAGE;
   }
   process.stdout.write(`host: ${hostLine(host)}\n`);
   process.stdout.write(`plan: ${plan.sources} sources → ${plan.targets.map((t) => t.variant).join(', ')}\n`);
@@ -440,7 +444,7 @@ function cmdStatus(args, asJson) {
   for (const p of rows) printPair(p);
   const hidden = plan.pairs.filter((p) => p.action !== 'skip').length - rows.length;
   if (hidden > 0) process.stdout.write(`... +${hidden} more\n`);
-  return EXIT.OK;
+  return ok ? EXIT.OK : EXIT.USAGE;
 }
 
 function formatSummary(summary) {
@@ -659,11 +663,37 @@ function cmdVerify(args, asJson) {
     return res.ok ? EXIT.OK : EXIT.WRITE;
   }
   process.stdout.write(`${into}:${id}\n`);
-  process.stdout.write(`turns: ${res.turns}  provenance: ${r.session.origin ? `${r.session.origin.variant}:${r.session.origin.sessionId}` : 'none'}\n`);
+  process.stdout.write(`turns: ${res.turns ?? r.session.turns.length}  provenance: ${r.session.origin ? `${r.session.origin.variant}:${r.session.origin.sessionId}` : 'none'}\n`);
   if (res.reason) process.stdout.write(`result: ${res.ok ? 'ok' : 'FAIL'} (${res.reason})\n`);
   else process.stdout.write('result: ok\n');
-  for (const m of res.mismatches.slice(0, 5)) process.stdout.write(`  turn ${m.index}: want ${String(m.want).slice(0, 12)} got ${String(m.got).slice(0, 12)}\n`);
+  if (res.error) process.stdout.write(`  ${res.error}\n`);
+  for (const m of res.mismatches?.slice(0, 5) ?? []) process.stdout.write(`  turn ${m.index}: want ${String(m.want).slice(0, 12)} got ${String(m.got).slice(0, 12)}\n`);
   return res.ok ? EXIT.OK : EXIT.WRITE;
+}
+
+function cmdRepair(args, asJson) {
+  const id = getFlag(args, 'id');
+  if (getFlag(args, 'into') !== 'minimax' || !id || id.includes(',') || id.startsWith('--')) {
+    out({ ok: false, error: 'usage: repair --into minimax --id <session-id> [--apply]' }, asJson);
+    return EXIT.USAGE;
+  }
+  const apply = args.includes('--apply') && !args.includes('--dry-run');
+  let lock;
+  try {
+    if (apply) lock = acquireLock('target:minimax');
+    if (lock?.ok === false) {
+      out({ ok: false, error: 'lock-timeout', holder: lock.holder }, asJson);
+      return EXIT.WRITE;
+    }
+    const result = upgradeMinimaxCompaction(ctxFromArgs(args), id, { apply });
+    out(result, asJson);
+    return result.ok ? EXIT.OK : EXIT.WRITE;
+  } catch (error) {
+    out({ ok: false, error: String(error?.message ?? error) }, asJson);
+    return EXIT.WRITE;
+  } finally {
+    lock?.release?.();
+  }
 }
 
 function cmdInstall(args, asJson) {
@@ -855,6 +885,7 @@ function cmdSwitchAccount(args, asJson) {
   return switchExit();
 }
 
+
 function cmdDetect(args, asJson) {
   const ctx = ctxFromArgs(args);
   const installed = detectInstalled(ctx);
@@ -971,6 +1002,8 @@ export function main(argv = process.argv.slice(2)) {
       return cmdImport(args.slice(1), asJson);
     case 'verify':
       return cmdVerify(args.slice(1), asJson);
+    case 'repair':
+      return cmdRepair(args.slice(1), asJson);
     case 'install':
       return cmdInstall(args.slice(1), asJson);
     case 'uninstall':

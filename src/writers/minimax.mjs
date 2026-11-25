@@ -1,10 +1,9 @@
-// writers/minimax.mjs — 写 MiniMax Code（只写 DB，不碰 revision 算法）
+// writers/minimax.mjs — 写 MiniMax Code 的规范历史文件、索引与显示投影
 //
-// 为什么可以只写 DB（本机 app.asar 取证）：
+// 正文源与物化（本机 app.asar 取证）：
 //   - 正文源选择链：messages.jsonl → authoritativeLedgerSnapshot → local_runtime_message_rows → sqliteBlob，
 //     文件缺失时回退到 DB 行；
-//   - canonical-history-materializer 会自己把 DB 行物化成 messages.jsonl 并计算 revision，
-//     所以我们不需要复现 revisionOfNormalized()。
+//   - 外部预发布 messages.jsonl 时，当前宿主需要物化 checkpoint 才能直接续写。
 // 列表可见性的 6 个硬门（缺一项就完全不可见，出自 repo/drizzle.js + repo/list-predicates.js）：
 //   columnar_version=3、agent_name IN ('mavis','main')、archived=0、visibility<>'hidden'、
 //   session_kind NOT IN ('peek','cron')、parent_session_id IS NULL。
@@ -16,20 +15,28 @@
 // 同一轮的所有消息共享一个 turn_id。整轮压成一行会让助手正文在宿主里消失，
 // 详见 turnToMessageGroups 的注释。
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { VARIANTS, configRoot } from '../hosts.mjs';
 import { tableExists, tableColumns, safeJson } from '../readers/base.mjs';
-import { ensureDir, isFile, cmpPath, canonicalDirPath } from '../util.mjs';
+import { ensureDir, isFile, cmpPath, canonicalDirPath, sha256hex } from '../util.mjs';
 import { writeRootOf, roleRoots } from '../roots.mjs';
 import { makeTitleSyncer } from './title-slots.mjs';
-import { writeSidecarProvenance } from '../provenance.mjs';
+import { buildProvenance, extractFromJsonObject, readSidecarProvenance, writeSidecarProvenance } from '../provenance.mjs';
+import { resolvePlacement } from '../placement.mjs';
 import { insertRowFiltered, newNodeId, updateRowFiltered, appendFileAtomic, writeFileAtomic } from './base.mjs';
 import { firstExisting } from '../readers/base.mjs';
 import { toNativeBlock, toolResultRowOfBlock } from '../pi-agent-blocks.mjs';
-import { missingImportedTurns } from '../readers/minimax.mjs';
+import { minimaxReader, planImportedTurnRepair, readPublishedMinimaxTurns } from '../readers/minimax.mjs';
+import { makeSession, makeTurn, messageItem, sessionCoreFingerprints } from '../ir.mjs';
+import { targetSessionId } from '../identity.mjs';
+import { verifyImported } from '../verify.mjs';
 import { fitTitleFor, TITLE_MAX } from '../titles.mjs';
-import { compactionInjectionKind } from '../text.mjs';
+import { compactionInjectionKind, compactionSummaryText } from '../text.mjs';
+import { minimaxRevision, planMinimaxHistory, portableSummary, readMinimaxHistory } from '../minimax-history.mjs';
+import { hasMinimaxPublication, pendingMinimaxHistory, recoverMinimaxPublications, registerMinimaxMaterialization,
+  repairMinimaxMaterialization, stageMinimaxPublication, verifiedMinimaxImportPrefix } from '../minimax-publication.mjs';
 
 function dbFile(ctx) {
   return firstExisting(roleRoots('minimax', ctx, 'db').filter((x) => x.kind === 'file'))?.path ?? null;
@@ -47,8 +54,11 @@ function historyFileOf(ctx, db, targetId) {
   if (!tableColumns(db, 'local_runtime_sessions').includes('history_relative_dir')) return null;
   const rel = db.prepare('SELECT history_relative_dir AS rel FROM local_runtime_sessions WHERE session_id = ?').get(targetId)?.rel;
   if (!rel) return null;
-  const f = path.join(root, String(rel), 'messages.jsonl');
-  return isFile(f) ? f : null;
+  const dir = path.resolve(root, String(rel));
+  const located = path.relative(root, dir);
+  if (!located || path.isAbsolute(located) || located === '..' || located.startsWith('..' + path.sep)) return null;
+  const f = path.join(dir, 'messages.jsonl');
+  return isFile(f) || readMinimaxHistory(dir).native ? f : null;
 }
 
 // 一轮 IR → 宿主消息帧（**唯一实现**，两条写入路径共用）。
@@ -113,13 +123,17 @@ function turnToMessageFrames(turn) {
 // toolCallId/toolName/isError），不塞进助手行的块里 —— 塞进去宿主解不出回执，它自己界面里
 // 那次调用只剩「发起」没有「结果」。同理块类型必须是 `toolCall`；`tool_use` / `tool_result`
 // 是 π 词表，宿主一个都不认（写进去那几次调用在它界面上直接消失）。
+function withReplayProvider(message) {
+  return message.role === 'assistant' && message.provider === undefined ? { ...message, provider: 'session-sync' } : message;
+}
+
 function frameToHistoryLines(frame, turnId, ts) {
   const blocks = [];
   const results = [];
   for (const b of frame.blocks) (b.type === 'tool_result' ? results : blocks).push(b);
   const lines = [];
   const push = (role, message) =>
-    lines.push({ message_id: `msg-${role}-v1-${newNodeId()}`, turn_id: turnId, message: { ...message, timestamp: ts } });
+    lines.push({ message_id: `msg-${role}-v1-${newNodeId()}`, turn_id: turnId, message: withReplayProvider({ ...message, timestamp: ts }) });
   const nativeBlocks = [];
   for (const b of blocks) {
     const nb = toNativeBlock(b);
@@ -160,6 +174,10 @@ function historyRootOf(ctx) {
   return writeRootOf('minimax', ctx, 'history')?.path ?? path.join(configRoot(ctx, 'minimax'), 'v2', 'sessions');
 }
 
+function defaultWorkspaceOf(ctx, targetId) {
+  return resolvePlacement(null, 'minimax', ctx, { placement: 'bucket', targetId }).directory;
+}
+
 /**
  * provenance 的**第二落点**：规范历史目录里的 sidecar。
  *
@@ -185,24 +203,163 @@ function writeProvenanceSidecar(dir, provenance) {
   }
 }
 
+const liveProbeTarget = Symbol('minimax-live-probe-target');
+
+function nativeProbeEnabled(ctx, liveTarget) {
+  if (!ctx.env?.MINIMAX_HOME || (!liveTarget && ctx.env.SESSION_SYNC_MINIMAX_NATIVE !== '1')) return false;
+  if (!fs.existsSync(ctx.env.MINIMAX_HOME)) return false;
+  const actual = fs.realpathSync(ctx.env.MINIMAX_HOME);
+  const configured = path.resolve(ctx.env.MINIMAX_HOME);
+  if (cmpPath(dbFile(ctx)) !== cmpPath(path.join(configured, 'v2', 'sqlite', 'runtime-state.sqlite')) ||
+      cmpPath(historyRootOf(ctx)) !== cmpPath(path.join(configured, 'v2', 'sessions'))) return false;
+  if ([dbFile(ctx), historyRootOf(ctx)].filter((file) => fs.existsSync(file)).some((file) => {
+    const rel = path.relative(actual, fs.realpathSync(file));
+    return path.isAbsolute(rel) || rel === '..' || rel.startsWith('..' + path.sep);
+  })) return false;
+  const userRoot = path.join(os.homedir(), '.minimax');
+  const live = fs.existsSync(userRoot) ? fs.realpathSync(userRoot) : userRoot;
+  if (liveTarget) return ctx[liveProbeTarget] === liveTarget && cmpPath(live) === cmpPath(actual);
+  const relative = path.relative(live, actual);
+  return path.isAbsolute(relative) || relative === '..' || relative.startsWith('..' + path.sep);
+}
+
+export function minimaxLiveProbeFixture(nonce, now = Date.now()) {
+  if (!/^[0-9a-f]{12}$/u.test(nonce ?? '')) throw new Error('invalid-minimax-live-probe-nonce');
+  const turns = ['covered', 'checkpoint', 'tail'].map((label, index) => {
+    const token = sha256hex(nonce + ':' + label).slice(0, 12);
+    const text = 'The literal value of ' + label.toUpperCase() + ' is ' + token + '.';
+    const items = [messageItem('user', text, now + index, index === 1)];
+    if (index !== 1) items.push(messageItem('assistant', 'Recorded.', now + index));
+    return makeTurn('user', items, now + index);
+  });
+  const session = makeSession({ id: 'session-sync-minimax-probe-' + nonce, variant: 'workbuddy-cn',
+    title: 'Session Sync MiniMax Probe ' + nonce, createdAt: now, updatedAt: now + 2, scope: 'none', turns });
+  return { session, targetId: targetSessionId('minimax', session) };
+}
+
+export function createMinimaxLiveProbe(ctx, nonce) {
+  const { session, targetId } = minimaxLiveProbeFixture(nonce);
+  const probeCtx = { ...ctx, [liveProbeTarget]: targetId };
+  if (!nativeProbeEnabled(probeCtx, targetId)) return { ok: false, error: 'minimax-live-probe-requires-default-root' };
+  return minimaxWriter.write(probeCtx, { session, targetId, mode: 'create', scope: 'none',
+    provenance: buildProvenance(session, session.createdAt, { scope: 'none' }) });
+}
+
+function standaloneSummary(turn) {
+  const items = turn.items ?? [];
+  const item = items[0];
+  if (item?.role !== 'user' || item.kind !== 'message' || item.compact !== true) return undefined;
+  if (items.slice(1).some((part) => part.role === 'user' || part.kind === 'attachment')) return undefined;
+  const summary = compactionSummaryText(item.text);
+  return summary.trim() && portableSummary({ role: 'compactionSummary', summary }) === summary ? summary : undefined;
+}
+
+function legacyGroups(records) {
+  const groups = [];
+  for (const record of records) {
+    if (!groups.length || record.message?.role === 'user') groups.push({ records: [] });
+    groups.at(-1).records.push({ ...record, message: withReplayProvider(record.message) });
+  }
+  for (const group of groups) {
+    const [first, ...rest] = group.records;
+    const content = first.message?.content;
+    if (first.message?.role !== 'user' || content?.length !== 1 || content[0].type !== 'text' ||
+        first.message.attachments?.length || first.turn_config ||
+        rest.some((row) => row.message?.attachments?.length || row.message?.content?.some?.((block) => block.type === 'image')) ||
+        !compactionInjectionKind(content[0].text)) continue;
+    const summary = compactionSummaryText(content[0].text);
+    if (summary.trim() && portableSummary({ role: 'compactionSummary', summary }) === summary) group.summary = summary;
+  }
+  return groups;
+}
+
+export function upgradeMinimaxCompaction(ctx, targetId, { apply = false } = {}) {
+  const dbPath = dbFile(ctx);
+  if (!dbPath) return { ok: false, error: 'db-not-found' };
+  const enabled = apply && nativeProbeEnabled(ctx);
+  const root = historyRootOf(ctx);
+  const db = new DatabaseSync(dbPath, { readOnly: !apply });
+  let publishing = false;
+  try {
+    db.exec('PRAGMA busy_timeout = 8000');
+    if (hasMinimaxPublication(dbPath, targetId)) {
+      if (!apply) return { ok: false, targetId, error: pendingMinimaxHistory };
+      if (!enabled) return { ok: false, targetId, error: 'minimax-native-history-write-unverified' };
+      recoverMinimaxPublications(db, dbPath, root, targetId);
+    }
+    if (apply) db.exec('BEGIN IMMEDIATE');
+    const file = historyFileOf(ctx, db, targetId);
+    const session = minimaxReader.read(ctx, targetId);
+    if (!file || !session?.origin || session.meta.fileIncomplete) return { ok: false, error: 'minimax-upgrade-requires-complete-import' };
+    const dir = path.dirname(file);
+    const history = readMinimaxHistory(dir);
+    if (history.error) return { ok: false, error: history.error };
+    let plan;
+    let result;
+    if (history.native) {
+      const checkpoint = repairMinimaxMaterialization(db, root, { id: targetId, history, apply });
+      const importedCount = verifiedMinimaxImportPrefix(db, targetId, history);
+      let assistantProviderMissing = 0;
+      const active = history.active.map((record, index) => {
+        if (index >= importedCount) return record;
+        const message = withReplayProvider(record.message);
+        if (message === record.message) return record;
+        assistantProviderMissing++;
+        return { ...record, message };
+      });
+      result = { ok: true, targetId, upgraded: 0, reason: 'already-native', checkpoint, dryRun: !apply };
+      if (!assistantProviderMissing || !apply) {
+        if (apply) db.exec('COMMIT');
+        return { ...result, assistantProviderMissing };
+      }
+      if (!enabled) return { ok: false, targetId, error: 'minimax-native-history-write-unverified', assistantProviderMissing };
+      plan = { active, snapshots: [] };
+      result.assistantProviderRepaired = assistantProviderMissing;
+    } else {
+      const groups = legacyGroups(history.active);
+      const boundaries = groups.filter((group) => group.summary !== undefined).length;
+      if (!boundaries || !apply) return { ok: true, targetId, boundaries, upgraded: 0, dryRun: !apply };
+      if (!enabled) return { ok: false, targetId, error: 'minimax-native-history-write-unverified' };
+      plan = planMinimaxHistory([], groups);
+      result = { ok: true, targetId, boundaries, upgraded: boundaries };
+    }
+    const before = minimaxRevision(history.active);
+    const fingerprints = sessionCoreFingerprints(session);
+    publishing = true;
+    const after = stageMinimaxPublication(db, dbPath, root, {
+      id: targetId, relativeDir: path.relative(root, dir).split(path.sep).join('/'), expected: before, plan,
+    });
+    const checked = minimaxReader.read(ctx, targetId, { verifyPublication: true });
+    const verified = checked && !checked.meta.historyError && checked.meta.historyRevision === after &&
+      JSON.stringify(fingerprints) === JSON.stringify(sessionCoreFingerprints(checked)) &&
+      JSON.stringify(session.origin) === JSON.stringify(checked.origin) && JSON.stringify(session.chain) === JSON.stringify(checked.chain);
+    if (!verified) throw new Error('minimax-upgrade-verification-failed');
+    db.exec('COMMIT');
+    recoverMinimaxPublications(db, dbPath, root, targetId);
+    return result;
+  } catch (error) {
+    if (db.isTransaction) db.exec('ROLLBACK');
+    if (publishing) {
+      try { recoverMinimaxPublications(db, dbPath, root, targetId); }
+      catch (recovery) { return { ok: false, targetId, error: String(error.message), recoveryError: String(recovery.message) }; }
+    }
+    return { ok: false, targetId, error: String(error?.message ?? error) };
+  } finally {
+    db.close();
+  }
+}
+
 /**
  * 自己落一份宿主的**规范历史文件**（新建会话时）。
  *
- * 为什么必须自己写（真机 2026-11-23）：
- *   宿主的物化器（`canonical-history-materializer`）在会话**没有 legacy 账本**时
- *   只会 `publishInitial(paths.messages, [])` —— 发布一个**空文件**，它不会从
- *   `local_runtime_message_rows` 回填。空文件一旦存在，它就是正文的首选源
- *   （读数链：messages.jsonl → 账本快照 → DB 行 → blob），
- *   把我们写进 DB 行的导入正文整个遮住 ⇒ 界面上只看得见宿主自己的新回合。
- *   反过来，物化器只在目标**不存在**时才发布空文件 ⇒ 我们先把规范文件写好，
- *   宿主就不会覆盖它，后续回合直接追加在后面（这正是 append 路径已有的做法）。
+ * AgentHost 用规范文件作为续写历史。导入预发布文件后，索引事务负责登记首次物化。
  *
  * 文件形态照宿主真机：`{message_id, turn_id, message}` 一行一条消息；
  * 同目录还要有 `manifest.json`（宿主校验它与行的 sessionId / createdAtMs 一致）。
  *
  * @returns {{ok:boolean, relativeDir?:string, dir?:string, error?:string}}
  */
-function writeCanonicalHistory(ctx, { sessionId, createdAtMs, updatedAtMs, lines }) {
+function writeCanonicalHistory(ctx, { sessionId, createdAtMs, updatedAtMs, lines, nativePlan }) {
   const relativeDir = historyRelativeDir(sessionId, createdAtMs);
   const root = historyRootOf(ctx);
   const dir = path.join(root, ...relativeDir.split('/'));
@@ -210,9 +367,13 @@ function writeCanonicalHistory(ctx, { sessionId, createdAtMs, updatedAtMs, lines
     ensureDir(dir);
     // 原子写：先写临时文件再改名 —— 宿主随时可能在读这个文件，半截 JSON 行会毁掉整份历史
     const messages = path.join(dir, 'messages.jsonl');
-    const tmpMessages = `${messages}.${process.pid}.tmp`;
-    fs.writeFileSync(tmpMessages, lines.length ? `${lines.map((l) => JSON.stringify(l)).join('\n')}\n` : '', 'utf8');
-    fs.renameSync(tmpMessages, messages);
+    if (nativePlan) {
+      if (isFile(messages)) throw new Error('minimax-existing-canonical-history');
+    } else {
+      const existing = isFile(messages) ? readMinimaxHistory(dir) : null;
+      if (existing?.native || existing?.error) throw new Error('minimax-existing-native-history');
+      writeFileAtomic(messages, lines.map((line) => JSON.stringify(line) + '\n').join(''));
+    }
     const manifest = {
       schemaVersion: 1,
       sessionId: String(sessionId),
@@ -444,32 +605,22 @@ function ensureProjectRow(db, { workspace, isDefault, createdAt, updatedAt }) {
  * 我们只往里补内容，不重排、不改写宿主写过的任何一行。
  */
 function readHistoryFileState(file) {
-  const out = { exists: false, size: 0, mtimeMs: 0, turnIds: new Set(), lines: [] };
-  let text;
   try {
     const st = fs.statSync(file);
-    out.exists = true;
-    out.size = st.size;
-    out.mtimeMs = st.mtimeMs;
-    text = fs.readFileSync(file, 'utf8');
-  } catch {
-    return out;
-  }
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue;
-    let ts = 0;
-    try {
-      const o = JSON.parse(line);
-      if (o?.turn_id) out.turnIds.add(String(o.turn_id));
-      ts = Number(o?.message?.timestamp) || 0;
-    } catch {
-      /* 坏行原样保留，不参与解析 */
+    const lines = fs.readFileSync(file, 'utf8').split('\n');
+    if (lines.at(-1) === '') lines.pop();
+    const recordLines = [];
+    for (const [index, line] of lines.entries()) {
+      if (!line.trim()) continue;
+      const record = safeJson(line, null);
+      if (!record || typeof record !== 'object' || Array.isArray(record)) return { invalid: true };
+      recordLines.push(index);
     }
-    // 时间戳缺失的行不参与排序（排到末尾）：它们的真实位置无从得知，
-    // 让它们留在末尾比按 0 排到最前面更安全。
-    out.lines.push({ ts: ts || Number.MAX_SAFE_INTEGER, text: line });
+    return { lines, recordLines, expectSize: st.size, expectMtimeMs: st.mtimeMs };
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    return { lines: [], recordLines: [], expectSize: -1 };
   }
-  return out;
 }
 
 /** 我们自己的 DB 行按 turn_id 分组（保持首次出现的顺序 = 时间顺序） */
@@ -493,7 +644,7 @@ function groupOurTurns(rows) {
  * 于是导入正文在模型上下文里消失（界面消息列表仍看得到，它读 DB 行）。
  * 本机现场：4 条会话的规范文件少了 1–64 轮导入正文（其中一条少了整整 64 轮）。
  *
- * 判据与补写内容都问读侧（`missingImportedTurns`）：**按内容**（核心指纹）判缺哪几轮 ——
+ * 判据与补写内容都问读侧：按有序核心指纹定位缺失轮及补写位置。
  * 宿主可能用自己的 turn_id 把我们的行重新物化进文件（内容一样、id 不同），
  * 按 id 判会把同一轮再补一遍，文件里就出现两次同样的内容。
  *
@@ -515,41 +666,37 @@ function repairCanonicalHistories(ctx) {
     const root = historyRootOf(ctx);
     const sessions = db.prepare('SELECT session_id, history_relative_dir FROM local_runtime_sessions').all();
     for (const s of sessions) {
-      if (!s.history_relative_dir) continue;
+      if (!s.history_relative_dir || hasMinimaxPublication(file, s.session_id)) continue;
       const dir = path.join(root, ...String(s.history_relative_dir).split('/'));
       const histFile = path.join(dir, 'messages.jsonl');
-      const missing = missingImportedTurns(db, s.session_id, dir);
+      const state = readHistoryFileState(histFile);
+      const { missing, ambiguous } = planImportedTurnRepair(db, s.session_id, dir);
       if (!missing.length) continue;
+      if (ambiguous || state.invalid) {
+        warnings.push('canonical-history-repair-ambiguous: ' + s.session_id);
+        continue;
+      }
 
       // 缺失轮次 → 宿主规范形状的行（与新建时同一套转换：IR → 帧 → 行）
-      const blocks = [];
-      for (const turn of missing) {
+      const insertions = new Map();
+      for (const { turn, beforeLine } of missing) {
         const ts = Number(turn.startedAt) || 0;
         const turnId = `turn_repair_${String(newNodeId())}`;
         const lines = [];
         for (const frame of turnToMessageFrames(turn)) {
           for (const l of frameToHistoryLines(frame, turnId, ts)) {
-            lines.push({ ts: ts || Number.MAX_SAFE_INTEGER, text: JSON.stringify(l) });
+            lines.push(JSON.stringify(l));
           }
         }
-        if (lines.length) blocks.push({ ts: ts || Number.MAX_SAFE_INTEGER, lines });
+        const at = state.recordLines[beforeLine] ?? state.lines.length;
+        if (!insertions.has(at)) insertions.set(at, []);
+        insertions.get(at).push(...lines);
       }
-      // 归并进文件：按时间戳找落点，但**我们各轮之间保持原顺序**。
-      // 为什么不能整体按时间戳排：源里的轮次顺序不是严格按时间戳的 —— 宿主注入的压缩摘要
-      // 时间戳会偏前（真机：摘要轮与下一轮被对调），一排就把两轮换了位置，
-      // 核心指纹从那一轮起整体错位 → 读回的内容与源对不上。
-      const state = readHistoryFileState(histFile);
-      const merged = [...state.lines];
-      let cursor = 0;
-      for (const block of blocks) {
-        let at = cursor;
-        while (at < merged.length && merged[at].ts <= block.ts) at++;
-        merged.splice(at, 0, ...block.lines);
-        cursor = at + block.lines.length;
-      }
-      const content = merged.length ? `${merged.map((l) => l.text).join('\n')}\n` : '';
+      const merged = state.lines.flatMap((line, index) => [...(insertions.get(index) ?? []), line]);
+      merged.push(...(insertions.get(state.lines.length) ?? []));
+      const content = merged.join('\n') + '\n';
       try {
-        writeFileAtomic(histFile, content, state.exists ? { expectSize: state.size, expectMtimeMs: state.mtimeMs } : {});
+        writeFileAtomic(histFile, content, state);
       } catch (err) {
         if (err?.code === 'CONCURRENT_MODIFICATION') {
           warnings.push(`canonical-history-repair-skipped: ${histFile}（宿主刚追加过这个文件，本次不覆盖，下次重跑再试）`);
@@ -689,6 +836,18 @@ export const minimaxWriter = {
    * 先把文件补齐，读侧与决策看到的才是同一条完整会话。
    */
   repair(ctx) {
+    if (nativeProbeEnabled(ctx)) {
+      const file = dbFile(ctx);
+      const db = new DatabaseSync(file);
+      try {
+        db.exec('PRAGMA busy_timeout = 8000');
+        recoverMinimaxPublications(db, file, historyRootOf(ctx));
+      } catch (error) {
+        return { ok: false, error: String(error.message), warnings: [] };
+      } finally {
+        db.close();
+      }
+    }
     return repairCanonicalHistories(ctx);
   },
 
@@ -753,6 +912,31 @@ export const minimaxWriter = {
       }
       const isDefault = Number(row.is_default_workspace) === 1 || scope === 'none';
       const want = String(cwd ?? row.workspace_dir ?? '').trim();
+      if (Number(row.is_default_workspace) === 1 && !String(row.workspace_dir ?? '').trim()) {
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          const current = db.prepare('SELECT workspace_dir, is_default_workspace, record_json, extra_data_json FROM local_runtime_sessions WHERE session_id = ?').get(String(targetId));
+          if (Number(current?.is_default_workspace) !== 1 || String(current.workspace_dir ?? '').trim()) {
+            return { ok: true, changed: false, warnings };
+          }
+          const historyFile = historyFileOf(ctx, db, targetId);
+          if (!extractFromJsonObject(safeJson(current.extra_data_json)) && !(historyFile && readSidecarProvenance(historyFile))) {
+            return { ok: true, changed: false, warnings };
+          }
+          const record = safeJson(current.record_json);
+          if (!record || record.sessionId !== String(targetId)) throw new Error('minimax-invalid-session-record');
+          const workspace = defaultWorkspaceOf(ctx, targetId);
+          if (!workspace) throw new Error('minimax-default-workspace-required');
+          ensureDir(workspace);
+          const sets = [['workspace_dir', workspace], ['project_workspace_dir', workspace],
+            ['record_json', JSON.stringify({ ...record, workspaceDir: workspace })]];
+          updateRowFiltered(db, 'local_runtime_sessions', sets, { session_id: String(targetId) });
+          db.exec('COMMIT');
+          return { ok: true, changed: true, dir: workspace, warnings };
+        } finally {
+          if (db.isTransaction) db.exec('ROLLBACK');
+        }
+      }
       if (!want || isDefault) return { ok: true, changed: false, warnings };
       db.exec('BEGIN IMMEDIATE');
       try {
@@ -793,22 +977,22 @@ export const minimaxWriter = {
     const warnings = [];
     const file = dbFile(ctx);
     if (!file || !isFile(file)) return { ok: false, error: 'db-not-found' };
+    const liveTarget = mode === 'create' && !force && ctx[liveProbeTarget] === targetId ? targetId : null;
 
     const turns = mode === 'append' ? (session.turns ?? []).slice(fromTurnIndex) : (session.turns ?? []);
     const now = Date.now();
     const createdAt = Number(session.createdAt) || now;
     const updatedAt = Number(session.updatedAt) || createdAt;
-    let workspace = String(session.cwd ?? '');
+    let workspace = String(session.cwd ?? '').trim();
     let isDefault = (scope ?? session.scope) === 'none' ? 1 : 0;
     if (!workspace && mode === 'append') {
-      // 追加进原生非项目会话：那行本来就落在宿主自生成的 default 桶里（workspace_dir 为空），
-      // 没有理由因为「调用方没给 cwd」就拒写 —— 沿用行上已有的落点
+      // 非项目 reader 隐藏内部 cwd，追加时从目标行取回实际运行目录。
       const cur = new DatabaseSync(file, { readOnly: true });
       try {
         const row = cur.prepare('SELECT workspace_dir, is_default_workspace FROM local_runtime_sessions WHERE session_id = ?').get(String(targetId));
         if (row) {
-          workspace = String(row.workspace_dir ?? '');
-          isDefault = Number(row.is_default_workspace) === 1 || !workspace ? 1 : 0;
+          workspace = String(row.workspace_dir ?? '').trim();
+          isDefault = Number(row.is_default_workspace) === 1 ? 1 : 0;
         }
       } catch {
         /* 读不到就仍按缺 cwd 处理 */
@@ -816,15 +1000,24 @@ export const minimaxWriter = {
         cur.close();
       }
     }
-    if (!workspace && !isDefault) return { ok: false, error: 'cwd-required: minimax 的行必须有 workspace_dir' };
+    if (!workspace && isDefault) workspace = defaultWorkspaceOf(ctx, targetId) ?? '';
+    if (!workspace) return { ok: false, error: 'cwd-required: minimax 的行必须有 workspace_dir' };
 
     const db = new DatabaseSync(file);
     let inserted = 0;
     let canonicalRel = null;
+    let publishing = false;
+    const root = historyRootOf(ctx);
     try {
       db.exec('PRAGMA busy_timeout = 8000');
+      const nativeEnabled = nativeProbeEnabled(ctx, liveTarget);
+      if (liveTarget && !nativeEnabled) return { ok: false, error: 'minimax-live-probe-requires-default-root' };
       if (!tableExists(db, 'local_runtime_sessions') || !tableExists(db, 'local_runtime_message_rows')) {
         return { ok: false, error: 'sessions-or-message-rows-missing' };
+      }
+      if (hasMinimaxPublication(file, targetId)) {
+        if (!nativeEnabled || liveTarget) throw new Error(pendingMinimaxHistory);
+        recoverMinimaxPublications(db, file, root, targetId);
       }
       db.exec('BEGIN IMMEDIATE');
       // 落点目录对齐到宿主已有的项目行：项目键是字节级目录串，
@@ -838,8 +1031,9 @@ export const minimaxWriter = {
         }
       }
       try {
-        if (workspace) ensureDir(workspace);
+        ensureDir(workspace);
       } catch (err) {
+        if (isDefault) throw err;
         warnings.push(`mkdir-failed: ${String(err?.message ?? err)}`);
       }
       // 连标题一起读回来：append 时要保留宿主/用户已有的名字（见下面 record.title 的判定）
@@ -882,28 +1076,51 @@ export const minimaxWriter = {
         if (!frames.length) continue;
         const turnId = `turn_${String(turnSeq).padStart(4, '0')}_${newNodeId()}`;
         turnSeq += 1;
-        prepared.push({ frames, turnId, ts: Number(turn.startedAt) || updatedAt });
+        const ts = Number(turn.startedAt) || updatedAt;
+        prepared.push({ frames, turnId, ts, summary: standaloneSummary(turn),
+          records: frames.flatMap((frame) => frameToHistoryLines(frame, turnId, ts)) });
       }
 
       // 宿主已有 messages.jsonl → 追加写进文件（reader 首选源），不再插 DB 行避免双份
       const histFile = mode === 'append' ? historyFileOf(ctx, db, targetId) : null;
+      const currentHistory = histFile ? readMinimaxHistory(path.dirname(histFile)) : null;
+      if (currentHistory?.error) throw new Error(currentHistory.error);
+      const useNative = (currentHistory?.native || prepared.some((group) => group.summary !== undefined)) && nativeEnabled;
+      if (currentHistory?.native && !useNative) throw new Error('minimax-native-history-write-unverified');
+      if (existing && mode === 'append' && !histFile && useNative) throw new Error('minimax-canonical-history-required');
+      const nativePlan = useNative ? planMinimaxHistory(currentHistory?.active ?? [], prepared) : null;
+      for (const [offset, turn] of turns.entries()) {
+        if (turn.items?.some((item) => item.compact) && (!nativePlan || standaloneSummary(turn) === undefined)) {
+          warnings.push('minimax-compaction-tagged: turn ' + (offset + fromTurnIndex + 1));
+        }
+      }
 
       // 新建会话：自己落一份宿主规范历史文件。
       // 不落的后果：宿主物化器只发布**空文件**，空文件成为正文首选源 → 导入正文在界面上消失。
-      // 落盘失败则退回 DB 行载体（老行为），并把 history_relative_dir 留 NULL 交给宿主绑定。
+      // 落盘失败则退回 DB 行载体，并把 history_relative_dir 留 NULL 交给宿主绑定。
       if (!existing) {
-        const lines = prepared.flatMap(({ frames, turnId, ts }) => frames.flatMap((f) => frameToHistoryLines(f, turnId, ts)));
+        if (liveTarget) {
+          const dir = path.join(root, historyRelativeDir(targetId, createdAt));
+          if (fs.existsSync(dir)) throw new Error('minimax-existing-canonical-history');
+          let parent = path.dirname(dir);
+          while (!fs.existsSync(parent)) parent = path.dirname(parent);
+          const expected = path.join(fs.realpathSync(root), path.relative(root, parent));
+          if (cmpPath(fs.realpathSync(parent)) !== cmpPath(expected)) throw new Error('minimax-live-probe-redirected-history');
+        }
+        const lines = prepared.flatMap(({ records }) => records);
         const ch = writeCanonicalHistory(ctx, {
           sessionId: String(targetId),
           createdAtMs: createdAt,
           updatedAtMs: updatedAt,
           lines,
+          nativePlan,
         });
+        if (!ch.ok && (nativePlan || ch.error.includes('minimax-existing-native-history'))) throw new Error(ch.error);
         if (ch.ok) {
           canonicalRel = ch.relativeDir;
           warnings.push(`canonical-history: ${ch.dir}`);
           // 来源标记的第二个落点：宿主会重写 extra_data_json，sidecar 才是活过那次重写的那一份
-          const sc = writeProvenanceSidecar(ch.dir, provenance);
+          const sc = nativePlan ? null : writeProvenanceSidecar(ch.dir, provenance);
           if (sc) warnings.push(`provenance-sidecar: ${sc}`);
         } else {
           warnings.push(ch.error);
@@ -967,11 +1184,10 @@ export const minimaxWriter = {
       //     带 session-sync-content 全量部件；文件里放不下这个槽）。文件是首选源，DB 行是兜底。
       //   · 追加进已有文件 → 只写文件：文件已是首选源，再插 DB 行会双份。
       const histLines = [];
-      for (const { frames, turnId, ts } of prepared) {
+      for (const { frames, turnId, ts, records } of prepared) {
         if (histFile) {
-          const lines = frames.flatMap((f) => frameToHistoryLines(f, turnId, ts));
-          histLines.push(...lines);
-          inserted += lines.length;
+          histLines.push(...records);
+          inserted += records.length;
           continue;
         }
         for (const f of frames) {
@@ -981,14 +1197,33 @@ export const minimaxWriter = {
           inserted++;
         }
       }
+      if (nativePlan && (canonicalRel || histLines.length)) {
+        const dir = histFile ? path.dirname(histFile) : path.join(root, canonicalRel);
+        publishing = true;
+        stageMinimaxPublication(db, file, root, {
+          id: targetId,
+          relativeDir: canonicalRel ?? path.relative(root, dir).split(path.sep).join('/'),
+          expected: currentHistory ? minimaxRevision(currentHistory.active) : null,
+          plan: nativePlan,
+          provenance,
+        });
+        const readback = verifyImported({ readSession: () => ({ turns: readPublishedMinimaxTurns(dir) }),
+          variant: 'minimax', sessionId: targetId, expectSource: session, mode, fromTurnIndex });
+        if (!readback.ok) throw new Error('minimax-native-readback-failed: ' + readback.reason);
+      } else if (canonicalRel) {
+        const active = prepared.flatMap(({ records }) => records);
+        registerMinimaxMaterialization(db, root, { id: targetId, relativeDir: canonicalRel,
+          revision: minimaxRevision(active), messageCount: active.length });
+      }
       db.exec('COMMIT');
+      if (publishing) recoverMinimaxPublications(db, file, root, targetId);
       if (histFile && histLines.length) {
         // 走 base 的单次 O_APPEND 原子追加：裸 appendFileSync 在多行时可能被宿主读到半截 JSON 行，
         // 而这一行正是宿主下一轮的上下文输入
-        appendFileAtomic(histFile, `${histLines.map((l) => JSON.stringify(l)).join('\n')}\n`);
+        if (!nativePlan) appendFileAtomic(histFile, histLines.map((line) => JSON.stringify(line) + '\n').join(''));
         warnings.push(`append-history-file: ${histFile}`);
         // 追加时同样刷新 sidecar：宿主的 extra_data_json 随时可能被重写，sidecar 是兜底那份
-        const sc = writeProvenanceSidecar(path.dirname(histFile), provenance);
+        const sc = nativePlan ? null : writeProvenanceSidecar(path.dirname(histFile), provenance);
         if (sc) warnings.push(`provenance-sidecar: ${sc}`);
       }
     } catch (err) {
@@ -996,6 +1231,10 @@ export const minimaxWriter = {
         db.exec('ROLLBACK');
       } catch {
         /* ignore */
+      }
+      if (publishing) {
+        try { recoverMinimaxPublications(db, file, root, targetId); }
+        catch (recovery) { warnings.push('minimax-publication-recovery-failed: ' + recovery.message); }
       }
       return { ok: false, error: `write-failed: ${String(err?.message ?? err)}`, targetId, warnings };
     } finally {

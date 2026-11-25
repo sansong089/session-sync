@@ -6,12 +6,32 @@
 //
 // 默认比对「核心指纹」（消息文本 + 工具调用）：reasoning / tool_result 输出
 // 跨宿主不可靠，用全量指纹会把正确写入误报成失败。strict=true 时用全量。
-import { sessionFingerprints, sessionCoreFingerprints } from './ir.mjs';
+import { coreItem, normalizeText, sessionFingerprints, sessionCoreFingerprints } from './ir.mjs';
+import { compactionInjectionKind } from './text.mjs';
 
-export function verifyImported({ readSession, variant, sessionId, expectSource, mode = 'create', strict = false }) {
+const COMPACTION_TARGETS = new Set(['codex', 'minimax', 'opencode', 'workbuddy-cn', 'workbuddy-intl']);
+
+function userTextRuns(turn, allowLegacyTags = false) {
+  const runs = [];
+  for (const item of turn?.items ?? []) {
+    if (item.kind !== 'message' || item.role !== 'user') continue;
+    const text = coreItem(item)?.t;
+    if (!text) continue;
+    const compact = item.compact === true || (allowLegacyTags && compactionInjectionKind(item.text) !== null);
+    const previous = runs.at(-1);
+    if (previous?.compact === compact) previous.text = normalizeText(previous.text + '\n\n' + text);
+    else runs.push({ compact, text });
+  }
+  return runs;
+}
+
+export function verifyImported({ readSession, variant, sessionId, expectSource, mode = 'create', strict = false, fromTurnIndex = 0 }) {
   const target = readSession(variant, sessionId);
   if (!target) {
     return { ok: false, reason: 'not-found', variant, sessionId };
+  }
+  if (target.meta?.historyError || expectSource?.meta?.historyError) {
+    return { ok: false, reason: 'history-incomplete', error: target.meta?.historyError ?? expectSource.meta.historyError, variant, sessionId };
   }
   const fp = strict ? sessionFingerprints : sessionCoreFingerprints;
   const got = fp(target);
@@ -20,6 +40,20 @@ export function verifyImported({ readSession, variant, sessionId, expectSource, 
   if (!expectSource) return result;
 
   const want = fp(expectSource);
+  if (COMPACTION_TARGETS.has(variant)) {
+    const compactionMismatches = [];
+    for (let i = fromTurnIndex; i < want.length; i++) {
+      const sourceRuns = userTextRuns(expectSource.turns[i], true);
+      const targetRuns = userTextRuns(target.turns[i]);
+      if ((sourceRuns.some((run) => run.compact) || targetRuns.some((run) => run.compact)) &&
+          JSON.stringify(sourceRuns) !== JSON.stringify(targetRuns)) compactionMismatches.push(i);
+    }
+    if (compactionMismatches.length) {
+      result.ok = false;
+      result.reason = 'compaction-mismatch';
+      result.compactionMismatches = compactionMismatches;
+    }
+  }
 
   if (mode === 'fork') {
     for (let i = 0; i < Math.min(want.length, got.length); i++) {

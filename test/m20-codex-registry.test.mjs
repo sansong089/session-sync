@@ -19,6 +19,7 @@ import { makeCtx } from '../src/hosts.mjs';
 import { seedHostSeen } from './matrix-home.mjs';
 import { planImport, executePlan } from '../src/import.mjs';
 import { readSession, listSessions } from '../src/readers/index.mjs';
+import { getWriter } from '../src/writers/index.mjs';
 import { bucketRoot } from '../src/hosts.mjs';
 import { backupsOf, strayBackups } from './backup-fixture.mjs';
 
@@ -274,6 +275,177 @@ test('codex 多 owner 空间且未标当前账户：退回顶层旧键并告警'
   assert.equal(st['thread-workspace-root-hints']?.[r.targetId], bucketRoot(ctx, 'codex'), '退回顶层旧键（保底）');
   assert.equal(st[`${OWNER_VALUE_PREFIX}thread-workspace-root-hints:${O1}`]?.[r.targetId], undefined, '不许乱写 owner 空间');
   assert.equal(st[`${OWNER_VALUE_PREFIX}thread-workspace-root-hints:${O2}`]?.[r.targetId], undefined, '不许乱写 owner 空间');
+});
+
+function createThreadsDb(root) {
+  // 线程库 fixture：按宿主必填列建（列少了写侧会按实际列裁剪，缺必填列则 INSERT 失败）
+  fs.mkdirSync(path.join(root, '.codex'), { recursive: true });
+  const db = new DatabaseSync(path.join(root, '.codex', 'state_5.sqlite'));
+  db.exec(`CREATE TABLE threads (
+    id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+    source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL,
+    sandbox_policy TEXT NOT NULL, approval_mode TEXT NOT NULL, creator_user_id TEXT, creator_account_id TEXT,
+    cli_version TEXT, first_user_message TEXT, preview TEXT, thread_source TEXT, history_mode TEXT,
+    recency_at INTEGER, recency_at_ms INTEGER, created_at_ms INTEGER, updated_at_ms INTEGER,
+    has_user_event INTEGER, tokens_used INTEGER, archived INTEGER, is_pinned INTEGER,
+    originator TEXT, memory_mode TEXT, name TEXT
+  )`);
+  db.close();
+}
+
+test('codex 宿主准入：session_meta 必须带 originator + cli_version，且必须登记 threads 索引行', () => {
+  const root = tmpRoot('codex-admit');
+  createThreadsDb(root);
+
+  const bucketCwd = J(path.join(root, 'Documents', 'Codex', '2026-11-24', 'admit'));
+  claudeSource(root, 's11', bucketCwd, ['准入测试的第一句']);
+  const ctx = ctxFor(root);
+  const r = executePlan(ctx, planImport(ctx, { from: ['claude'], into: ['codex'] }), { apply: true, lock: false })[0];
+  assert.equal(r.ok, true, JSON.stringify(r));
+
+  // ① session_meta 的两个准入字段：缺任一宿主就判 invalid_session_metadata，整条不可见
+  const meta = firstLine(r.path);
+  assert.equal(meta.type, 'session_meta');
+  assert.ok(meta.payload.originator, 'session_meta 必须带 originator（宿主准入条件）');
+  assert.ok(meta.payload.cli_version, 'session_meta 必须带 cli_version（宿主准入条件）');
+
+  // ② threads 索引行：宿主不给外部 rollout 建行，缺它宿主迁移器报 missing_sqlite_metadata
+  const db2 = new DatabaseSync(path.join(root, '.codex', 'state_5.sqlite'));
+  const row = db2.prepare('SELECT * FROM threads WHERE id = ?').get(r.targetId);
+  assert.ok(row, '必须登记 threads 索引行（宿主侧栏的列表来源）');
+  assert.equal(row.title, '准入测试的第一句', '标题取源会话标题（claude 侧是首问派生）');
+  assert.equal(row.first_user_message, '准入测试的第一句');
+  assert.equal(row.rollout_path, r.path);
+  assert.equal(row.cwd, `\\\\?\\${r.placement.directory}`, 'cwd 要用宿主的长路径前缀形态');
+  assert.equal(row.history_mode, 'legacy', '新登记的行留给宿主迁移器分页化');
+  assert.equal(row.name, null, 'name 是用户手动改名才有的列，不许代写');
+  assert.equal(db2.prepare('SELECT COUNT(*) n FROM threads').get().n, 1, '只登记这一条');
+
+  // ③ 幂等：重跑不得留下第二行
+  executePlan(ctx, planImport(ctx, { from: ['claude'], into: ['codex'] }), { apply: true, lock: false });
+  assert.equal(db2.prepare('SELECT COUNT(*) n FROM threads').get().n, 1, '重导不得重复登记');
+  db2.close();
+});
+
+const rolloutLines = (file) => fs.readFileSync(file, 'utf8').trimEnd().split('\n').map(JSON.parse);
+const playback = (rows) => rows.filter((row) => row.type === 'event_msg').map((row) => row.payload);
+
+test('codex desktop playback includes each imported and appended turn', () => {
+  const root = tmpRoot('codex-replay');
+  createThreadsDb(root);
+  const cwd = J(path.join(root, 'Documents', 'Codex', '2026-11-24', 'replay'));
+  claudeSource(root, 's12', cwd, ['first', 'second']);
+  const ctx = ctxFor(root);
+  const run = () => executePlan(ctx, planImport(ctx, { from: ['claude'], into: ['codex'] }), { apply: true, lock: false })[0];
+  const result = run();
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const rows = rolloutLines(result.path);
+  const events = playback(rows);
+  assert.deepEqual(events.map((event) => event.type), [
+    'task_started', 'user_message', 'agent_message', 'task_complete',
+    'task_started', 'user_message', 'agent_message', 'task_complete',
+  ]);
+  assert.deepEqual(events.filter((event) => event.type === 'user_message').map((event) => event.message), ['first', 'second']);
+  assert.deepEqual(events.filter((event) => event.type === 'agent_message').map((event) => event.message), ['答first', '答second']);
+  assert.equal(events[0].turn_id, events[3].turn_id);
+  assert.notEqual(events[0].turn_id, events[4].turn_id);
+  assert.equal(readSession('codex', ctx, result.targetId).session.turns.length, 2);
+
+  claudeSource(root, 's12', cwd, ['first', 'second', 'third']);
+  const appended = run();
+  assert.equal(appended.action, 'append', JSON.stringify(appended));
+  const after = rolloutLines(result.path);
+  assert.deepEqual(after.slice(0, rows.length), rows);
+  assert.equal(playback(after).filter((event) => event.type === 'user_message').at(-1).message, 'third');
+  assert.ok(after.every((row, index) => row.ordinal === index), 'ordinals advance across append');
+});
+
+test('codex reimport repairs pre-playback exports in place and is idempotent', () => {
+  const root = tmpRoot('codex-replay-repair');
+  createThreadsDb(root);
+  const cwd = J(path.join(root, 'Documents', 'Codex', '2026-11-24', 'repair'));
+  claudeSource(root, 's13', cwd, ['restore']);
+  const ctx = ctxFor(root);
+  const run = () => executePlan(ctx, planImport(ctx, { from: ['claude'], into: ['codex'] }), { apply: true, lock: false })[0];
+  const result = run();
+  const old = rolloutLines(result.path).filter((row) => row.type !== 'event_msg');
+  delete old[0].payload.originator;
+  delete old[0].payload.cli_version;
+  writeJsonl(result.path, old);
+  const db = new DatabaseSync(path.join(root, '.codex', 'state_5.sqlite'));
+  try {
+    db.prepare('DELETE FROM threads WHERE id = ?').run(result.targetId);
+    const repaired = run();
+    assert.equal(repaired.action, 'skip', JSON.stringify(repaired));
+    assert.equal(repaired.targetId, result.targetId);
+    const rows = rolloutLines(result.path);
+    assert.ok(rows[0].payload.originator && rows[0].payload.cli_version);
+    assert.equal(playback(rows).filter((event) => event.type === 'user_message').length, 1);
+    assert.deepEqual(rows.filter((row) => row.type === 'response_item').map((row) => row.payload),
+      old.filter((row) => row.type === 'response_item').map((row) => row.payload));
+    assert.equal(db.prepare('SELECT title FROM threads WHERE id = ?').get(result.targetId)?.title, 'restore');
+    assert.ok(backupsOf(root, 'codex').length > 0);
+    const before = fs.readFileSync(result.path);
+    assert.equal(run().action, 'skip');
+    assert.deepEqual(fs.readFileSync(result.path), before);
+  } finally {
+    db.close();
+  }
+});
+
+test('codex repairs partial legacy replay in place and respects index title capacity', (t) => {
+  const root = tmpRoot('codex-partial-replay');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  createThreadsDb(root);
+  const ctx = ctxFor(root);
+  claudeSource(root, 'partial', root, ['first', 'second']);
+  const result = executePlan(ctx, planImport(ctx, { from: ['claude'], into: ['codex'] }), { apply: true, lock: false })[0];
+  assert.equal(result.ok, true);
+  const complete = rolloutLines(result.path);
+  const missing = new Set(['second', '答second']);
+  const partial = complete.filter((row) => row.type !== 'event_msg' || !missing.has(row.payload.message));
+  partial.splice(partial.length - 1, 0, { timestamp: partial.at(-1).timestamp, type: 'event_msg', payload: { type: 'item_completed' } });
+  writeJsonl(result.path, partial);
+  const db = new DatabaseSync(path.join(root, '.codex', 'state_5.sqlite'));
+  try {
+    db.prepare('DELETE FROM threads WHERE id = ?').run(result.targetId);
+    const ensure = () => getWriter('codex').ensureIndex(ctx, { targetId: result.targetId, title: 'A'.repeat(550) });
+    assert.ok(ensure().warnings.some((warning) => warning.startsWith('codex-replay-repaired')));
+    const actual = playback(rolloutLines(result.path));
+    assert.deepEqual(actual.filter((event) => event.type !== 'item_completed'), playback(complete));
+    assert.equal(actual.filter((event) => event.type === 'item_completed').length, 1);
+    assert.equal(db.prepare('SELECT title FROM threads WHERE id = ?').get(result.targetId).title.length, 500);
+    const bytes = fs.readFileSync(result.path);
+    ensure();
+    assert.deepEqual(fs.readFileSync(result.path), bytes);
+  } finally { db.close(); }
+});
+
+test('codex repair leaves an append made while the replacement is being synced', (t) => {
+  const root = tmpRoot('codex-replay-race');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  createThreadsDb(root);
+  const ctx = ctxFor(root);
+  claudeSource(root, 'race', root, ['first']);
+  const result = executePlan(ctx, planImport(ctx, { from: ['claude'], into: ['codex'] }), { apply: true, lock: false })[0];
+  assert.equal(result.ok, true);
+  const rows = rolloutLines(result.path).filter((row) => row.type !== 'event_msg');
+  writeJsonl(result.path, rows);
+  const tail = { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ text: 'host tail' }] } };
+  const fsync = fs.fsyncSync;
+  let appended = false;
+  t.mock.method(fs, 'fsyncSync', (fd) => {
+    const replacement = fs.readdirSync(path.dirname(result.path)).some((name) => name.startsWith(path.basename(result.path) + '.tmp-'));
+    if (!appended && replacement) {
+      fs.appendFileSync(result.path, JSON.stringify(tail) + '\n');
+      appended = true;
+    }
+    return fsync(fd);
+  });
+  const ensured = getWriter('codex').ensureIndex(ctx, { targetId: result.targetId });
+  assert.ok(appended);
+  assert.ok(ensured.warnings.includes('codex-replay-repair-conflict: rollout changed during repair'));
+  assert.deepEqual(rolloutLines(result.path), [...rows, tail]);
 });
 
 test('codex 标题取 state_<N>.sqlite 的 threads（name 优先，其次 title），不是首条消息', () => {

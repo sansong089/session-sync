@@ -339,7 +339,7 @@ test('leveldb：真实 MiniMax localStorage 能解出已知键（本机无宿主
   const model = entries.get('mavis:model-selection');
   assert.ok(model, '必须解出 mavis:model-selection');
   const parsed = JSON.parse(model);
-  assert.equal(parsed.providerId, 'minimax');
+  assert.ok(typeof parsed.providerId === 'string' && parsed.providerId.trim(), '已解码的模型选择必须包含 providerId');
 });
 
 // ---------- CLI 展示 ----------

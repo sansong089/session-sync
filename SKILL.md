@@ -287,7 +287,8 @@ WorkBuddy 的会话列表读的是 `workbuddy.db` 的 `sessions` 索引表，**�
 | `switch-unsupported` | 该宿主的本地会话行**不带账号归属**（如 qoder 现行 `chat_sessions` 无账号列），改它不产生宿主可见的变化。返回里带取证依据与替代路径（qoder = 跨安装导入），不是 bug，不要去「修」它 |
 | 写了但宿主看不到（ZCode） | ZCode 的侧栏读的是**第二个库** `~/.zcode/v2/tasks-index.sqlite` 的 `tasks` 表，正文写进 `cli/db/db.sqlite` 不足以让它出现。`warnings` 里若有 `tasks-index-absent` / `tasks-table-absent` 就是这个原因；另外落点目录必须真实存在（宿主按目录打开），写侧已 `mkdir -p` |
 | 写了但宿主看不到（MiniMax） | 主列表有 6 个硬门：`columnar_version=3`、`agent_name IN ('mavis','main')`、`archived=0`、`visibility<>'hidden'`、`session_kind NOT IN ('peek','cron')`、`parent_session_id IS NULL`，少一项完全不可见（侧栏分组靠 `project_id` 列，不靠目录） |
-| 写了但 Codex 侧栏看不到 | rollout 文件之外还必须写注册表 `~/.codex/.codex-global-state.json`（非项目进 `projectless-thread-ids` + `thread-workspace-root-hints` + `thread-projectless-output-directories`；项目进 `local-projects` + `thread-project-assignments` + `project-order`） |
+| MiniMax 压缩历史 | reader 回读可达快照链。普通导入保留标签摘要。原生写入可在隔离根验证，当前登录实例的真机探针仅创建单条合成会话。`repair --into minimax --id <id>` 预览已有标签能否原地升级。隔离写入中断时用同一隔离根重跑；若报告活动 revision 冲突，保留现场并查看 `references/program-spec.md`。 |
+| 写了但 Codex 侧栏看不到，或打开后没有正文 | 查 `state_<N>.sqlite` 的 `threads` 索引、全局注册表及 rollout 的 `session_meta` 和 legacy 回放事件。对带 session-sync 来源标记的旧导入复跑同一条 `import --apply` 可自愈。`verify` 校验的是 session-sync 读回，桌面可读性用宿主 `thread/read` 复核。 |
 | 写了但 CodeBuddy 看不到 | 会话必须在 `<root>/projects/<compressPath(真实 cwd)>/<会话ID>.jsonl`，行内 `sessionId` 与文件名一致；用 `codebuddy -r <id>` 复核（未登录时停在 auth 提示 = 已加载；提示 `No conversation found` = 没进对目录/文件名） |
 | `target-exists` | 目标已有该会话且非 append 场景；确认后加 `--force`（会备份） |
 | `unreadable-target` | 目标的既有正文**解不开**（坏行 / 压缩帧对不上）。写侧一律中止且一字不改 —— 把「读不懂」当成「没有历史」再整份重写，会真删掉用户历史。按消息里的路径修好或移走那个文件再重跑（`--force` 是显式授权的整份替换，会先备份） |

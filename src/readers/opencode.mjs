@@ -10,6 +10,7 @@ import { provenanceFromObject, applyProvenanceToIR } from '../provenance.mjs';
 import { openDb, safeJson, tableExists, tableHasColumn, existingFiles, assembleTurns, deriveTitle, stripSystemInjections, inTimeRange, adoptSiblingIdentity, TOOL_RESULT_ONLY, TOOL_NULL_INPUT, opencodeSessionLabel, projectNameMap } from './base.mjs';
 import { classicListFromDb, classicReadFromDb } from './opencode-classic.mjs';
 import { legacyOpencodeId, isNativeOpencodeId, importedNativeId } from '../opencode-id.mjs';
+import { compactionInjectionKind, compactionSummaryText } from '../text.mjs';
 
 // 候选库可能不止一个（env 指定的库 + XDG/ Roaming 默认库并存）：全部读，再由 listSessions 按 id 合并
 function dbFiles(ctx) {
@@ -69,6 +70,28 @@ function contentItems(content, ts) {
         break; // step-start / step-finish 等机械事件
     }
   }
+  return items;
+}
+
+function userTextItems(raw, ts) {
+  const text = stripSystemInjections(raw);
+  if (!text) return [];
+  if (!text.startsWith('<') && compactionInjectionKind(text)) return [messageItem('user', text, ts, true)];
+  const items = [];
+  const wrapper = /(?:^|(?<=\n\n))(<(cb_summary|conversation_history_summary)>[\s\S]*?<\/\2>)(?=\n\n|$)/g;
+  const pushPlain = (start, end) => {
+    const body = text.slice(start, end).trim();
+    if (body) items.push(messageItem('user', body, ts));
+  };
+  let start = 0;
+  for (const match of text.matchAll(wrapper)) {
+    const body = compactionSummaryText(match[0]);
+    if (!body.trim()) continue;
+    pushPlain(start, match.index);
+    items.push(messageItem('user', body, ts, true));
+    start = match.index + match[0].length;
+  }
+  pushPlain(start, text.length);
   return items;
 }
 
@@ -152,9 +175,7 @@ function readOne(file, id) {
       const data = safeJson(m.data, {});
       const ts = Number(data?.time?.created) || Number(m.time_created) || 0;
       if (m.type === 'user') {
-        const items = [];
-        const userText = stripSystemInjections(data.text);
-        if (userText) items.push(messageItem('user', userText, ts));
+        const items = userTextItems(data.text, ts);
         for (const f of data.files || []) {
           // 宿主原生 FileAttachment 把引用放在 source.uri；历史导入写成 {url,type:'file'}。
           // 两者都认，往返时引用不丢。

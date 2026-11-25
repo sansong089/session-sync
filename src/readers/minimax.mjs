@@ -14,13 +14,15 @@ import { makeSession, messageItem, reasoningItem, toolCallItem, toolResultItem, 
 import { toPiBlock, toolResultItemOfRow } from '../pi-agent-blocks.mjs';
 import { compactionInjectionKind, compactionSummaryText } from '../text.mjs';
 import { provenanceFromObject, applyProvenanceToIR, readSidecarProvenance } from '../provenance.mjs';
-import { openDb, safeJson, tableExists, tableColumns, firstExisting, assembleTurns, deriveTitle, stripSystemInjections, parseJsonl, toMs, fileMtime, inTimeRange,
+import { openDb, safeJson, tableExists, tableColumns, firstExisting, assembleTurns, deriveTitle, stripSystemInjections, toMs, fileMtime, inTimeRange,
   parseArgs, outputText,
 } from './base.mjs';
 import { isFile, isDir, cmpPath } from '../util.mjs';
 import { writeRootOf, roleRoots } from '../roots.mjs';
 import { readLocalStorage } from '../leveldb.mjs';
 import { previewTitle } from '../titles.mjs';
+import { hasMinimaxSnapshots, missingToolReceipt, portableSummary, readMinimaxHistory } from '../minimax-history.mjs';
+import { hasMinimaxPublication, pendingMinimaxHistory } from '../minimax-publication.mjs';
 
 /**
  * 宿主主列表的谓词（实测本机 4 行里只有 1 行会出现在宿主列表：另外 3 行是
@@ -179,6 +181,7 @@ function toEntry(rec, fallbackTs) {
 
   // 工具回执：独立一行，带 toolCallId/toolName/isError —— 直接成 tool_result 条目
   if (rawRole === 'toolresult' || rawRole === 'tool_result') {
+    if (msg.isError === true && msg.details?.[missingToolReceipt] === true) return null;
     return { role: 'tool', ts, items: [toolResultItemOfRow(msg, ts)] };
   }
   // 宿主注入的内部提醒（session_identity_reminder / todo_cadence_reminder …）：
@@ -188,8 +191,10 @@ function toEntry(rec, fallbackTs) {
     const t = String(msg.content ?? '');
     return t ? { role: 'system', ts, items: [noteItem(t, ts)] } : null;
   }
-  // 压缩摘要是宿主上下文管理产物（{role, summary}，无 content 块）：不搬
-  if (rawRole === 'compactionsummary') return null;
+  if (rawRole === 'compactionsummary' || Object.hasOwn(msg, 'archonCompaction')) {
+    const text = compactionSummaryText(portableSummary(msg) ?? '');
+    return text.trim() ? { role: 'user', ts, items: [messageItem('user', text, ts, true)] } : null;
+  }
 
   const role = rawRole === 'user' ? 'user' : 'assistant';
   const items = [];
@@ -240,19 +245,19 @@ function toEntry(rec, fallbackTs) {
 
 function readV2Messages(dir) {
   const file = path.join(dir, 'messages.jsonl');
-  if (!isFile(file)) return null;
+  if (!isFile(file) && !isFile(path.join(dir, 'history-catalog.json')) && !hasMinimaxSnapshots(dir)) return null;
   const manifestPath = path.join(dir, 'manifest.json');
   const manifest = safeJson(isFile(manifestPath) ? fs.readFileSync(manifestPath, 'utf8').trim() || '{}' : '{}', {}) || {};
   // 全量读：list 与 read 必须同口径（m53）。早先 list 走采样（大文件读头尾），
   // 于是同一个会话 list 报 1 轮、read 报 67 轮 —— 用户按 list 挑会话，挑到的是错的。
-  const text = fs.readFileSync(file, 'utf8');
-  const lines = parseJsonl(text);
+  const history = readMinimaxHistory(dir);
+  const lines = history.records;
   const entries = [];
   // 文件里出现过的 turn_id：判「文件是不是缺了我们自己写的那几轮」要用
   const turnIds = new Set();
   let createdAt = toMs(manifest.createdAtMs) || 0;
   let updatedAt = toMs(manifest.updatedAtMs) || 0;
-  for (const rec of lines) {
+  for (const [lineIndex, rec] of lines.entries()) {
     if (rec?.turn_id) turnIds.add(String(rec.turn_id));
     const e = toEntry(rec, createdAt);
     if (!e) continue;
@@ -260,14 +265,25 @@ function readV2Messages(dir) {
       if (!createdAt) createdAt = e.ts;
       if (e.ts > updatedAt) updatedAt = e.ts;
     }
-    entries.push(e);
+    entries.push({ ...e, lineIndex });
   }
   return {
     entries,
     turnIds,
+    history,
     createdAt,
     updatedAt: updatedAt || fileMtime(file),
   };
+}
+
+export function readPublishedMinimaxTurns(dir) {
+  const body = readV2Messages(dir);
+  if (!body || body.history.error) throw new Error(body?.history.error ?? 'minimax-history-missing');
+  return assembleTurns(body.entries);
+}
+
+export function minimaxRecordTurns(records) {
+  return assembleTurns(records.map((record) => toEntry(record, 0)));
 }
 
 function readRowMessages(db, sessionId) {
@@ -348,6 +364,9 @@ function readRowMessages(db, sessionId) {
  */
 function pickBody(db, row, dir) {
   const v2 = dir ? readV2Messages(dir) : null;
+  if (v2?.history.native || v2?.history.error) {
+    return { entries: v2.entries, storage: 'v2-files', v2, fileIncomplete: Boolean(v2.history.error), historyError: v2.history.error };
+  }
   const rows = readRowMessages(db, row.session_id);
   const fileEntries = v2?.entries ?? [];
   if (!fileEntries.length) {
@@ -355,14 +374,52 @@ function pickBody(db, row, dir) {
     return { entries: rows.entries, storage: 'message-rows', v2, rows, fileIncomplete: rows.ourEntries.length > 0 };
   }
   if (!rows.ourEntries.length) return { entries: fileEntries, storage: 'v2-files', v2, rows, fileIncomplete: false };
-  const fileFp = new Set(assembleTurns(fileEntries).map(turnCoreFingerprint));
-  const missing = assembleTurns(rows.ourEntries).some((t) => !fileFp.has(turnCoreFingerprint(t)));
-  if (missing) return { entries: rows.entries, storage: 'message-rows', v2, rows, fileIncomplete: true };
+  if (alignImportedTurns(rows.ourEntries, fileEntries).missing.length) {
+    return { entries: rows.entries, storage: 'message-rows', v2, rows, fileIncomplete: true };
+  }
   return { entries: fileEntries, storage: 'v2-files', v2, rows, fileIncomplete: false };
 }
 
+function alignImportedTurns(expected, found) {
+  const positions = new Map();
+  const boundaries = [];
+  for (const entry of found) {
+    if (entry.items.length && (!boundaries.length || entry.role === 'user')) boundaries.push(entry.lineIndex);
+  }
+  for (const [index, turn] of assembleTurns(found).entries()) {
+    const fp = turnCoreFingerprint(turn);
+    if (!positions.has(fp)) positions.set(fp, []);
+    positions.get(fp).push(index);
+  }
+  let next = 0;
+  const matched = new Map();
+  const missing = [];
+  let ambiguous = false;
+  let pending = [];
+  for (const turn of assembleTurns(expected)) {
+    const fp = turnCoreFingerprint(turn);
+    const matching = positions.get(fp) ?? [];
+    const count = matched.get(fp) ?? 0;
+    let offset = count;
+    while (offset < matching.length && matching[offset] < next) offset++;
+    if (offset > count) ambiguous = true;
+    if (offset >= matching.length) {
+      const absent = { turn, beforeLine: null };
+      pending.push(absent);
+      missing.push(absent);
+      continue;
+    }
+    matched.set(fp, offset + 1);
+    for (const absent of pending) absent.beforeLine = boundaries[matching[offset]];
+    pending = [];
+    next = matching[offset] + 1;
+  }
+  for (const absent of pending) absent.beforeLine = boundaries[next] ?? null;
+  return { missing, ambiguous };
+}
+
 /**
- * 我们自己写的那几轮里，**文件里还没有**的那些（以 IR 轮次给出，按时间顺序）。
+ * 按原始顺序返回缺失的导入轮和它们在规范文件内的插入锚点。
  *
  * 判据用**内容**（核心指纹）而不是 turn_id：宿主可能用自己的 turn_id 把我们的行
  * 重新物化进文件（内容一样、id 不同）—— 那种情况文件是完整的，
@@ -373,14 +430,14 @@ function pickBody(db, row, dir) {
  * @param db 已打开的 minimax 库
  * @param sessionId 会话 id
  * @param dir 规范历史目录（可为 null —— 没有文件就等于全缺）
- * @returns {Array<object>} 缺失轮次的 IR（可直接交给写侧的 IR → 文件行转换）
+ * @returns {{missing: Array<{turn:object, beforeLine:number|null}>, ambiguous?:boolean}}
  */
-export function missingImportedTurns(db, sessionId, dir) {
+export function planImportedTurnRepair(db, sessionId, dir) {
   const rows = readRowMessages(db, sessionId);
-  if (!rows.ourEntries.length) return [];
+  if (!rows.ourEntries.length) return { missing: [] };
   const v2 = dir ? readV2Messages(dir) : null;
-  const fileFp = new Set(assembleTurns(v2?.entries ?? []).map(turnCoreFingerprint));
-  return assembleTurns(rows.ourEntries).filter((t) => !fileFp.has(turnCoreFingerprint(t)));
+  if (v2?.history.native || v2?.history.error) return { missing: [] };
+  return alignImportedTurns(rows.ourEntries, v2?.entries ?? []);
 }
 
 function isGenericTitle(t) {
@@ -423,7 +480,9 @@ export const minimaxReader = {
         // 采样得到的是近似值，而 read 读的是全量 —— 同一个会话两个数，
         // 用户按 list 挑会话、按 0 轮过滤，看到的都是错的。
         // 同源同算法：同一份 entries、同一套 assembleTurns 口径，list.turns 必然等于 read 的轮次。
+        const pending = hasMinimaxPublication(file, row.session_id);
         const body = pickBody(db, row, dir);
+        if (pending || hasMinimaxPublication(file, row.session_id)) body.historyError = pendingMinimaxHistory;
         const entries = body.entries;
         const preview = previewOf(entries);
         const { cwd, scope, internalPath } = workspaceOf(row, kinds);
@@ -436,10 +495,11 @@ export const minimaxReader = {
           projectName: cwd ? aliases.get(cmpPath(cwd)) ?? '' : '',
           scope,
           internalPath,
-          createdAt: toMs(row.created_at_ms) || v2?.createdAt || 0,
-          updatedAt: fileMtime(dir ?? file) || toMs(row.updated_at_ms) || v2?.updatedAt || 0,
+          createdAt: toMs(row.created_at_ms) || body.v2?.createdAt || 0,
+          updatedAt: fileMtime(dir ?? file) || toMs(row.updated_at_ms) || body.v2?.updatedAt || 0,
           turns: assembleTurns(entries).length,
           turnsApprox: false,
+          ...(body.historyError ? { historyError: body.historyError } : {}),
           model: safeJson(row.record_json, null)?.model ?? null,
           provenance: provenanceOf(row) || (dir ? readSidecarProvenance(path.join(dir, 'messages.jsonl')) : null),
           sourcePath: dir ?? file,
@@ -453,7 +513,7 @@ export const minimaxReader = {
     }
   },
 
-  read(ctx, id) {
+  read(ctx, id, { verifyPublication = false } = {}) {
     const file = dbFile(ctx);
     if (!file) return null;
     const db = openDb(file);
@@ -465,7 +525,9 @@ export const minimaxReader = {
       const root = historyRoot(ctx);
       const dir = row.history_relative_dir ? path.join(root, row.history_relative_dir) : null;
       // 取数口径与 list 完全一致（同一处 pickBody）—— 两个数必须一样
+      const pending = !verifyPublication && hasMinimaxPublication(file, id);
       const body = pickBody(db, row, dir);
+      if (pending || (!verifyPublication && hasMinimaxPublication(file, id))) body.historyError = pendingMinimaxHistory;
       const entries = body.entries;
       const v2 = body.v2;
 
@@ -491,6 +553,8 @@ export const minimaxReader = {
           storage: body.storage,
           // 文件不完整（缺了我们自己写的那几轮）时正文取自 DB 行 —— 如实标出来
           fileIncomplete: body.fileIncomplete,
+          ...(body.historyError ? { historyError: body.historyError } : {}),
+          ...(v2?.history.native ? { historyGeneration: v2.history.generation, historyRevision: v2.history.revision } : {}),
         },
       });
       applyProvenanceToIR(session, prov);

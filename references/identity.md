@@ -173,9 +173,11 @@ originKey = "<origin.variant>:<origin.sessionId>"
 压缩摘要在 opencode 落成宿主**原生 compaction 行**（`type='compaction'` / `status='completed'`，
 摘要正文进 `data.summary`）：宿主把最新一条 completed 摘要当历史边界、只读它之后的消息，
 上下文估算随之变小。写成普通 user 消息的话，超大导入会话续写时会被整体压平成一条超模型上下文的请求。
-读回时**一条 compaction 行 = 一轮** user 条目（统一包成 `<cb_summary>`），`list` 计数用同一判据，
+读回时**一条 compaction 行 = 一轮** user 条目（裸摘要正文 + `compact:true`），`list` 计数用同一判据，
 轮次边界与核心指纹都不位移。混排真实用户文本 / 带附件 / 剥壳后为空 → 仍走普通 user 行：
 空摘要会被读侧跳过，写出去就丢一轮。摘要正文一个字不丢，只是不再冒充用户提问。
+
+Codex 的 `compacted` 与 WorkBuddy 的 `cmp_` 按同一归一化口径往返，纯摘要在目标还原成原生边界。Codex 的加密压缩边界没有可移植明文，留在源端元数据。OpenCode v2 的普通 user 行可用摘要标签携带同轮的压缩片段。导入写后校验单独检查可移植摘要语义，差异判定与身份派生继续使用核心指纹。同源源副本可向核心前缀一致且用户块可一一对齐的保留者补压缩标记。见 `test/m91-compaction-normalization.test.mjs`。
 
 验证：`test/m37-turn-boundary.test.mjs`（三类形状逐一回读 + 轮首附件的 18 目标全矩阵 + 归位边界）
 + `test/m7-matrix.test.mjs`（源里带多段用户文本，17 个目标逐个比对核心指纹）

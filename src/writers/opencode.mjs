@@ -200,7 +200,12 @@ function turnToEvents(turn, session, modelRef) {
       },
     });
   } else if (userMsgs.length || userFiles.length) {
-    events.push({ type: 'user', ts: firstUserTs, data: { time: { created: firstUserTs }, text: userMsgs.map((it) => it.text).join('\n\n'), files: userFiles, agents: [] } });
+    const text = userMsgs.map((item) => {
+      if (!isCompactSegment(item)) return item.text;
+      const summary = compactionSummaryText(item.text);
+      return summary.trim() ? '<cb_summary>' + summary + '</cb_summary>' : item.text;
+    }).join('\n\n');
+    events.push({ type: 'user', ts: firstUserTs, data: { time: { created: firstUserTs }, text, files: userFiles, agents: [] } });
   }
 
   let content = null;

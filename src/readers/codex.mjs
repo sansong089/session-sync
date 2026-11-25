@@ -4,7 +4,7 @@
 //
 // 事件：session_meta / event_msg / response_item / world_state / turn_context
 //      / token_usage_record / compacted
-// 只取 response_item：event_msg/item_completed 是同一内容的重复投影，必须跳过避免双份
+// 对话取 response_item 与 compacted；event_msg/item_completed 是重复投影。
 //  response_item.payload.type:
 //    message(role developer|user|assistant, content[{type:'input_text'|'output_text',text}])
 //    reasoning(summary[], encrypted_content="ocxr1:<base64 JSON{txt}>")
@@ -28,6 +28,7 @@ import { provenanceFromObject, applyProvenanceToIR, readSidecarProvenance } from
 import { assembleTurns, deriveTitle, stripSystemInjections, walkFiles, parseJsonl, readHead, toMs, fileMtime, inTimeRange,
   parseArgs, pushAssistantItem, tableColumns, outputText } from './base.mjs';
 import { previewTitle } from '../titles.mjs';
+import { compactionInjectionKind, compactionSummaryText } from '../text.mjs';
 
 // session_meta 首行含 base_instructions 全文，可达数百 KB，取身份时要读够窗口
 const META_WINDOW = 2 * 1024 * 1024;
@@ -230,6 +231,52 @@ function isInjection(text) {
   return CODEX_INJECTION_PATTERNS.some((re) => re.test(t));
 }
 
+function codexUserItems(payload, ts) {
+  const parts = (Array.isArray(payload.content) ? payload.content : [])
+    .map((part) => part?.text).filter((text) => typeof text === 'string' && text);
+  if (!parts.some(compactionInjectionKind)) {
+    const text = parts.join('\n\n');
+    const body = isInjection(text) ? '' : stripSystemInjections(text);
+    return body ? [messageItem('user', body, ts)] : [];
+  }
+  return parts.flatMap((text) => {
+    const compact = compactionInjectionKind(text) !== null;
+    const body = compact ? compactionSummaryText(text) : isInjection(text) ? '' : stripSystemInjections(text);
+    return body.trim() ? [messageItem('user', body, ts, compact)] : [];
+  });
+}
+
+function userItemsForEvent(ev, previous) {
+  const ts = toMs(ev.timestamp);
+  if (ev.type === 'compacted') {
+    const text = plaintextSummary(ev.payload);
+    const mirror = previous?.type === 'response_item' && previous.timestamp === ev.timestamp &&
+      previous.payload?.type === 'message' && previous.payload.role === 'user' &&
+      previous.payload.content?.every?.((part) => /^<(?:cb_summary|conversation_history_summary)>/u.test(part?.text ?? '')) &&
+      text === compactText(codexUserItems(previous.payload, ts));
+    return text.trim() && !mirror ? [messageItem('user', text, ts, true)] : [];
+  }
+  if (ev.type === 'response_item' && ev.payload?.type === 'message' && ev.payload.role === 'user') {
+    return codexUserItems(ev.payload, ts);
+  }
+  return null;
+}
+
+function plaintextSummary(payload) {
+  const text = payload?.message;
+  return typeof text === 'string' ? compactionSummaryText(text) : '';
+}
+
+function compactText(items) {
+  return items.length && items.every((item) => item.compact) ? items.map((item) => item.text).join('\n\n') : '';
+}
+
+function previousBodyEvent(previous, event) {
+  if (event.type === 'event_msg' && event.payload?.type === 'user_message' &&
+      previous?.timestamp === event.timestamp && previous.payload?.role === 'user') return previous;
+  return event;
+}
+
 function consumeMeta(ev, acc) {
   const ts = toMs(ev.timestamp);
   if (ts) {
@@ -272,26 +319,30 @@ function replayEntries(lines) {
   // 只按「调用名回落成 tool」会把源侧读成 tool、而写侧按 callId 合并后回读成真实调用名（exec）——
   // 同一会话两套名字 → 指纹分歧 → 复跑判 fork 而不是收敛。记住配对的名字即可。
   const toolNames = new Map();
+  let previous;
 
   for (const ev of lines) {
+    const userItems = userItemsForEvent(ev, previous);
+    previous = previousBodyEvent(previous, ev);
+    if (userItems) {
+      if (userItems.length) {
+        entries.push({ role: 'user', ts: userItems[0].ts, items: userItems });
+      }
+      continue;
+    }
     if (ev.type !== 'response_item') continue;
     const p = ev.payload ?? {};
     const ts = toMs(ev.timestamp);
 
     if (p.type === 'message') {
-      const role = p.role === 'user' ? 'user' : p.role === 'assistant' ? 'assistant' : null;
-      if (!role) continue; // developer / system 注入
+      if (p.role !== 'assistant') continue;
       const parts = [];
       for (const c of Array.isArray(p.content) ? p.content : []) {
         if (typeof c?.text === 'string' && c.text) parts.push(c.text);
       }
-      let text = parts.join('\n\n');
-      if (role === 'user') {
-        if (isInjection(text)) continue;
-        text = stripSystemInjections(text);
-      }
+      const text = parts.join('\n\n');
       if (!text) continue;
-      entries.push({ role, ts, items: [messageItem(role, text, ts)] });
+      entries.push({ role: 'assistant', ts, items: [messageItem('assistant', text, ts)] });
       continue;
     }
 
@@ -338,17 +389,14 @@ export const codexReader = {
       let preview = '';
       for (const seg of g.segments) {
         const file = seg.file;
+        let previous;
         for (const ev of eventsForList(file)) {
           consumeMeta(ev, acc);
-          if (ev.type === 'response_item' && ev.payload?.type === 'message' && ev.payload.role === 'user') {
-            const raw = (ev.payload.content ?? []).map((c) => c?.text ?? '').join('\n');
-            if (!isInjection(raw)) {
-              const t = stripSystemInjections(raw);
-              if (t) {
-                userMsgs++;
-                if (!preview) preview = t;
-              }
-            }
+          const items = userItemsForEvent(ev, previous);
+          previous = previousBodyEvent(previous, ev);
+          if (items?.length) {
+            userMsgs++;
+            preview ||= items.map((item) => item.text).join('\n');
           }
         }
       }
@@ -386,6 +434,11 @@ export const codexReader = {
     for (const ev of lines) consumeMeta(ev, acc);
 
     const turns = assembleTurns(replayEntries(lines));
+    const compactions = lines.filter((ev) => ev.type === 'compacted').map((ev) => {
+      const encrypted = Array.isArray(ev.payload?.replacement_history) &&
+        ev.payload.replacement_history.some((item) => item?.type === 'compaction' && item.encrypted_content);
+      return { timestamp: toMs(ev.timestamp), kind: plaintextSummary(ev.payload).trim() ? 'plaintext' : encrypted ? 'encrypted' : 'opaque' };
+    });
     const session = makeSession({
       id: String(id),
       variant: 'codex',
@@ -401,6 +454,7 @@ export const codexReader = {
         segments: g.segments.map((s) => s.file),
         hasGit: !!acc.hasGit,
         git: acc.git,
+        ...(compactions.length ? { compactions } : {}),
         ...(g.archived ? { archived: true } : {}),
       },
     });

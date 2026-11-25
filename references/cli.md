@@ -290,6 +290,16 @@ session-sync verify --into <变体> <会话ID>
 
 ---
 
+## repair
+
+```bash
+session-sync repair --into minimax --id <session-id> [--apply]
+```
+
+按会话预览或修复 MiniMax 历史。对于原生导入，若活动链、工作区、来源及原发布 revision 都通过校验，`--apply` 可补缺失的宿主物化登记。旧标签转原生仍遵循原生写入的探针限制。
+
+此命令也可补齐已验证的原生导入记录中缺失的助手 `provider`。预览返回 `assistantProviderMissing`。改写活动文件和恢复待发布事务均要求启用隔离探针，实际补齐条数由 `assistantProviderRepaired` 返回。首次物化登记只涉及 SQLite，可独立补齐。
+
 ## install
 
 ```

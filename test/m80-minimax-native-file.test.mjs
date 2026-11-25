@@ -92,6 +92,7 @@ test('读原生文件：五种 role 各归各位，工具回执不许变成助�
   const rel = '2026/11/06/08-13-39-244-session_x';
   const callId = 'call_00_a';
   writeNativeHistory(root, rel, [
+    { message_id: 'msg-cs', turn_id: 'turn-0:compaction', message: { role: 'compactionSummary', summary: '## Goal\n读日志' } },
     { message_id: 'msg-u', turn_id: 'turn-1', message: { role: 'user', content: [{ type: 'text', text: '查日志' }], timestamp: 1790422866491 } },
     { message_id: 'msg-a1', turn_id: 'turn-1', message: { role: 'assistant', content: [
       { type: 'thinking', thinking: '先读文件' },
@@ -104,14 +105,12 @@ test('读原生文件：五种 role 各归各位，工具回执不许变成助�
     } },
     // 宿主内部注入：display:false = 宿主自己都不显示
     { message_id: 'msg-c1', turn_id: 'turn-1', message: { role: 'custom', customType: 'session_identity_reminder', content: '<system-reminder>YOUR SESSION ID: mvs_x</system-reminder>', display: false, timestamp: 1790422883000 } },
-    // 压缩摘要：无 content 块
-    { message_id: 'msg-cs', turn_id: 'turn-1:compaction', message: { role: 'compactionSummary', summary: '## Goal\n读日志' } },
     { message_id: 'msg-a2', turn_id: 'turn-1', message: { role: 'assistant', content: [{ type: 'text', text: '日志读完' }], timestamp: 1790422943324 } },
   ]);
   insertSession(file, { id: 'mvs_read0001', rel });
 
   const s = readSession('minimax', ctxFor(root), 'mvs_read0001').session;
-  assert.equal(s.turns.length, 1, '同一 turn_id 下的回执行不得开新轮');
+  assert.equal(s.turns.length, 2, '原生压缩摘要独占一轮，工具回执不得开新轮');
   const items = s.turns.flatMap((t) => t.items);
 
   const assistantTexts = items.filter((i) => i.kind === 'message' && i.role === 'assistant').map((i) => i.text);
@@ -132,7 +131,7 @@ test('读原生文件：五种 role 各归各位，工具回执不许变成助�
 
   assert.equal(items.filter((i) => i.kind === 'reasoning').length, 1, 'thinking 块要读成 reasoning');
   assert.ok(!items.some((i) => String(i.text ?? '').includes('YOUR SESSION ID')), 'display:false 的注入不搬');
-  assert.ok(!items.some((i) => String(i.text ?? '').includes('## Goal')), '压缩摘要不搬');
+  assert.deepEqual(items.filter((item) => item.compact).map((item) => item.text), ['## Goal\n读日志']);
 });
 
 test('append 进原生文件时按文件型形状写：toolCall 块 + 独立 toolResult 行', () => {

@@ -65,17 +65,16 @@ function turnToEvents(turn, session) {
   let userBlocks = null;
   let userTs = 0;
   let userCompact = false;
+  const hasAttachment = (turn.items ?? []).some((it) => it.kind === 'attachment');
   const flushUser = () => {
     if (userBlocks && userBlocks.length) {
       // 归一化 → workbuddy 原生：整轮都是压缩摘要时，正文包 <cb_summary> 壳 + compact 标记，
       // emit 据此生成 cmp_ id / providerData（真机原生压缩行形态）。混排真实文本则兜底 plain user。
       const ev = {
         type: 'message', role: 'user', ts: userTs,
-        content: userCompact
-          ? userBlocks.map((b) => ({ ...b, text: `<cb_summary>${compactionSummaryText(b.text)}</cb_summary>` }))
-          : userBlocks,
+        content: userBlocks,
       };
-      if (userCompact) ev.compact = true;
+      if (userCompact && !hasAttachment) ev.compact = true;
       events.push(ev);
     }
     userBlocks = null;
@@ -88,14 +87,16 @@ function turnToEvents(turn, session) {
   for (const it of turn.items ?? []) {
     const ts = it.ts || session.updatedAt || session.createdAt;
     if (it.kind === 'message' && it.role === 'user') {
+      const text = it.compact ? compactionSummaryText(it.text) : it.text;
+      const compact = it.compact === true && Boolean(text.trim());
       if (!userBlocks) {
         userBlocks = [];
         userTs = ts;
-        userCompact = it.compact === true;
-      } else if (it.compact !== true) {
+        userCompact = compact;
+      } else if (!compact) {
         userCompact = false;
       }
-      userBlocks.push({ type: 'input_text', text: it.text });
+      userBlocks.push({ type: 'input_text', text: compact ? '<cb_summary>' + text + '</cb_summary>' : text });
       continue;
     }
     switch (it.kind) {
@@ -149,8 +150,7 @@ function buildLines(session, turns, targetId, startParent, provenance, opts = {}
     const { compact: _c, ...rest } = obj;
     const line = {
       id,
-      parentId: parent,
-      ...(compact ? { logicalParentId: parent } : {}),
+      ...(compact ? { logicalParentId: parent } : { parentId: parent }),
       ...rest,
       sessionId,
       cwd,

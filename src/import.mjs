@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import { buildProvenance, tagTitle } from './provenance.mjs';
 import { targetSessionId, forkSessionId, forkBranchKey, originKeyOf } from './identity.mjs';
 import { decideAction, isFpPrefix } from './diff.mjs';
-import { sessionCoreFingerprints } from './ir.mjs';
+import { coreItem, sessionCoreFingerprints } from './ir.mjs';
 import { cmpPath } from './util.mjs';
 import { listSessions, readSession } from './readers/index.mjs';
 import { getWriter } from './writers/index.mjs';
@@ -27,6 +27,11 @@ import { resolvePlacement } from './placement.mjs';
 import { writeGate } from './roots.mjs';
 import { ALL_VARIANTS } from './hosts.mjs';
 import { fitTitleFor, normalizeTitle, titleMaxOf } from './titles.mjs';
+import { pendingMinimaxHistory } from './minimax-publication.mjs';
+
+function sourceKey(variant, id) {
+  return variant + '\u0000' + id;
+}
 
 function pairKey(target, targetId, sourceVariant, sourceId) {
   // 键含源身份：同 origin 的分叉副本会被源侧去重保留下来，属于不同内容的不同导入，
@@ -58,7 +63,7 @@ function dedupeSources(ctx, sources) {
       let fp = null;
       try {
         const r = readSession(s.variant, ctx, s.id);
-        if (r.ok && r.session) fp = sessionCoreFingerprints(r.session);
+        if (!s.historyError && r.ok && r.session && !r.session.meta?.historyError) fp = sessionCoreFingerprints(r.session);
       } catch {
         /* 读不出就保留，交给执行期再判 */
       }
@@ -79,6 +84,29 @@ function dedupeSources(ctx, sources) {
     list.push(...keep.map((x) => x.s));
   }
   return { list, dropped };
+}
+
+function recoverSourceCompaction(ctx, source, donors) {
+  if (!donors?.length) return source;
+  const turns = source.turns.slice();
+  const fp = sessionCoreFingerprints(source);
+  const userText = (item) => item.kind === 'message' && item.role === 'user';
+  let changed = false;
+  for (const donor of donors) {
+    const { session } = readSession(donor.variant, ctx, donor.id);
+    if (!session || session.meta?.historyError || originKeyOf(session) !== originKeyOf(source) || !isFpPrefix(sessionCoreFingerprints(session), fp)) continue;
+    for (const [i, turn] of session.turns.entries()) {
+      const from = turn.items.filter(userText);
+      if (!from.some((item) => item.compact)) continue;
+      const to = turns[i].items.filter(userText);
+      if (from.length !== to.length || from.some((item, j) => coreItem(item)?.t !== coreItem(to[j])?.t)) continue;
+      const marks = new Set(to.filter((item, j) => !item.compact && from[j].compact && coreItem(item)?.t));
+      if (!marks.size) continue;
+      turns[i] = { ...turns[i], items: turns[i].items.map((item) => marks.has(item) ? { ...item, compact: true } : item) };
+      changed = true;
+    }
+  }
+  return changed ? { ...source, turns } : source;
 }
 
 // 落点选项：CLI 的 --cwd / --account / --placement 原样透传给唯一策略出口
@@ -296,38 +324,42 @@ function resolveDecision(target, sourceSession, index, readSessionFn) {
   const readTarget = (id) => {
     if (readCache.has(id)) return readCache.get(id);
     const raw = readSessionFn(target, id);
-    const v = raw && typeof raw === 'object' && 'ok' in raw ? raw : { ok: true, session: raw ?? null };
+    let v = raw && typeof raw === 'object' && 'ok' in raw ? raw : { ok: true, session: raw ?? null };
+    if (v.session?.meta?.historyError) v = { ...v, ok: false, error: v.session.meta.historyError, historyError: true };
     readCache.set(id, v);
     return v;
   };
   const baseRead = baseSummary ? readTarget(baseId) : null;
-  if (baseSummary && baseRead && baseRead.ok === false) {
-    return {
+  const baseError = baseSummary && baseRead?.ok === false ? {
       action: 'error',
       targetId: baseId,
       at: 0,
       reason: 'target-unreadable',
-      error: `target-unreadable: ${baseRead.error ?? 'unknown'}（目标存在但读不出来，不覆盖）`,
+      error: baseRead.historyError ? baseRead.error : `target-unreadable: ${baseRead.error ?? 'unknown'}（目标存在但读不出来，不覆盖）`,
       sameLineage: null,
       baseId,
       parentId: null,
       targetSession: null,
-    };
-  }
+    } : null;
+  if (baseError && !baseRead.historyError) return baseError;
   const baseSession = baseRead?.ok ? baseRead.session : null;
 
   const candidates = [];
+  let damagedSibling = baseError;
   for (const s of index?.byOrigin?.get(originKey) ?? []) {
     if (s.archived === true) continue;
     const id = String(s.id);
     // 源与目标同变体时，源会话本身也在目标列表里 —— 它不是可写入的基准
     if (target === sourceSession.variant && id === String(sourceSession.id)) continue;
     const r = id === baseId && baseRead ? baseRead : readTarget(id);
+    if (r.historyError) damagedSibling ??= { action: 'error', targetId: id, at: 0, reason: 'target-unreadable',
+      error: r.error, sameLineage: null, baseId, parentId: null, targetSession: null };
     if (r.ok === false) continue; // 读不动的候选不能当基准，也不能当「不存在」
     if (r.session) candidates.push({ id, session: r.session, summary: s });
   }
 
   if (candidates.length === 0) {
+    if (damagedSibling) return damagedSibling;
     if (!baseSummary) return { action: 'create', targetId: baseId, at: 0, reason: null, sameLineage: null, baseId, parentId: null, targetSession: null };
     const baseOrigin = originKeyOf(baseSummary);
     if (baseOrigin === originKey) {
@@ -393,6 +425,7 @@ function resolveDecision(target, sourceSession, index, readSessionFn) {
     };
   }
 
+  if (damagedSibling) return damagedSibling;
   const appends = evaluated.filter((x) => x.d.action === 'append');
   if (appends.length > 0) {
     const best = appends.sort((a, b) => b.d.at - a.d.at)[0];
@@ -472,7 +505,7 @@ export function planImport(ctx, opts = {}) {
   }
   // 默认跳过空会话（0 轮且轮次为精确值；采样得到的 0 不可信，不据此丢弃）
   if (!opts.includeEmpty) {
-    picked = picked.filter((s) => !(s.turns === 0 && !s.turnsApprox));
+    picked = picked.filter((s) => s.historyError || !(s.turns === 0 && !s.turnsApprox));
   }
   // --limit 语义：每个来源最多 N 条（多来源各自取最近 N 条，比全局截断更可预期）
   if (opts.limit > 0) {
@@ -500,6 +533,7 @@ export function planImport(ctx, opts = {}) {
   for (const src of picked) {
     const srcDesc = { variant: src.variant, id: src.id, origin: src.provenance?.origin ?? null };
     const originKey = originKeyOf(srcDesc);
+    if (src.historyError) errors.push({ variant: src.variant, phase: 'read-source', id: String(src.id), error: src.historyError });
     for (const target of into) {
       const idx = targetIndex.get(target);
       const baseId = String(targetSessionId(target, srcDesc));
@@ -519,7 +553,9 @@ export function planImport(ctx, opts = {}) {
 
       let decided;
       const sameOrigin = idx?.byOrigin?.get(originKey) ?? [];
-      if (!base.targetExists && sameOrigin.length === 0) {
+      if (src.historyError) {
+        decided = { ...base, action: 'error', reason: 'source-history-incomplete', error: src.historyError };
+      } else if (!base.targetExists && sameOrigin.length === 0) {
         // 快速路径：目标没有这条会话的任何形态 → create，不读源正文
         decided = base;
       } else {
@@ -529,10 +565,14 @@ export function planImport(ctx, opts = {}) {
           const r = readSession(src.variant, ctx, src.id);
           srcIr = r.ok && r.session ? r.session : null;
           srcIrCache.set(cacheKey, srcIr);
+          if (!srcIr || srcIr.meta?.historyError) {
+            errors.push({ variant: src.variant, phase: 'read-source', id: String(src.id), error: srcIr?.meta?.historyError ?? r.error ?? 'not-found' });
+          }
         }
         if (!srcIr) {
-          errors.push({ variant: src.variant, phase: 'read-source', id: String(src.id), error: 'not-found' });
           decided = { ...base, action: 'error', reason: 'source-not-readable' };
+        } else if (srcIr.meta?.historyError) {
+          decided = { ...base, action: 'error', reason: 'source-history-incomplete', error: srcIr.meta.historyError };
         } else {
           const d = resolveDecision(target, srcIr, idx, (v, id) => readSession(v, ctx, id));
           const { targetSession, ...rest } = d;
@@ -753,6 +793,14 @@ export function executePlan(ctx, plan, { apply = false, force = false, lock = tr
     return results;
   }
 
+  const compactionDonors = new Map();
+  for (const { kept, dropped } of plan.sourceDuplicates ?? []) {
+    const key = sourceKey(kept.variant, kept.id);
+    const donors = compactionDonors.get(key) ?? [];
+    donors.push(dropped);
+    compactionDonors.set(key, donors);
+  }
+
   // 每个目标第一次真正写入前先做一次索引/ID 自愈（旧版导入的裸 uuid 等）
   const repairedTargets = new Set();
   // 锁内决策用的目标索引：按目标缓存，写入后把新会话并回去（同一批次后续 pair 才能看见）
@@ -794,7 +842,8 @@ export function executePlan(ctx, plan, { apply = false, force = false, lock = tr
   }
 
   for (const p of plan.pairs) {
-    if (p.action === 'error') {
+    const recoverable = p.target === 'minimax' && p.reason === 'target-unreadable' && p.error === pendingMinimaxHistory;
+    if (p.action === 'error' && !recoverable) {
       results.push({ ...p, executed: false });
       continue;
     }
@@ -856,6 +905,17 @@ export function executePlan(ctx, plan, { apply = false, force = false, lock = tr
       // ---- skip：内容没变，但落点/索引/标题仍可能需要自愈 ----
       // 锁内定位到的摘要优先（plan 期那份可能已经过时：另一个进程刚搬过、刚改过名）
       if (p.action === 'skip') {
+        const checks = [[p.sourceVariant, p.sourceId, 'source-history-incomplete'], [p.target, p.targetId, 'target-unreadable']];
+        let incomplete = false;
+        for (const [variant, id, reason] of checks) {
+          if (variant !== 'minimax') continue;
+          const { session } = readSession(variant, ctx, id);
+          if (!session?.meta?.historyError) continue;
+          results.push({ ...p, action: 'error', executed: false, ok: false, reason, error: session.meta.historyError });
+          incomplete = true;
+          break;
+        }
+        if (incomplete) continue;
         const summary = freshIdx.summaryById.get(String(p.targetId)) ?? p.targetSummary ?? null;
         results.push(applySkipSelfHeal({ p, writer, ctx, summary, reason: p.reason ?? 'skip', freshIdx }));
         continue;
@@ -866,10 +926,18 @@ export function executePlan(ctx, plan, { apply = false, force = false, lock = tr
         results.push({ ...p, executed: false, ok: false, error: srcRead.error ?? 'source-not-readable' });
         continue;
       }
-      const sourceSession = srcRead.session;
+      if (srcRead.session.meta?.historyError) {
+        results.push({ ...p, executed: false, ok: false, reason: 'source-history-incomplete', error: srcRead.session.meta.historyError });
+        continue;
+      }
+      const sourceSession = recoverSourceCompaction(ctx, srcRead.session, compactionDonors.get(sourceKey(p.sourceVariant, p.sourceId)));
 
       const fresh = resolveDecision(p.target, sourceSession, freshIdx, (v, id) => readSession(v, ctx, id));
       const { targetSession: dstSession, ...freshRest } = fresh;
+      if (fresh.action === 'error') {
+        results.push({ ...p, ...freshRest, executed: false, ok: false });
+        continue;
+      }
       if (fresh.action === 'skip') {
         // 元数据漂移：源侧只改了标题（内容没变 → 指纹相同 → 判 identical），
         // 目标侧标题却还停在导入那一刻的旧名。skip 本身是对的（正文没变，不该重写），
@@ -995,6 +1063,7 @@ export function executePlan(ctx, plan, { apply = false, force = false, lock = tr
           sessionId: targetId,
           expectSource: sourceSession,
           mode,
+          fromTurnIndex: action === 'append' ? fresh.at : 0,
         });
       } catch (err) {
         verify = { ok: false, reason: String(err?.message ?? err) };

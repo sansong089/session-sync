@@ -177,15 +177,15 @@ function replayEntries(lines) {
       case 'message': {
         const role = ev.role === 'user' ? 'user' : ev.role === 'assistant' ? 'assistant' : null;
         if (!role) break;
+        const compactRow = role === 'user' && ev.providerData?.isSummary === true &&
+          (ev.providerData.isCompacted === true || String(ev.id ?? '').startsWith('cmp_'));
         const items = [];
         for (const c of Array.isArray(ev.content) ? ev.content : []) {
           const kind = String(c?.type ?? '');
           if (typeof c?.text === 'string' && c.text) {
             const text = role === 'user' ? stripSystemInjections(c.text) : c.text;
             if (text) {
-              // 归一化：workbuddy 原生压缩摘要（<cb_summary> 等标签壳）→ 剥壳裸正文 + compact 位。
-              // 正文与语义正交，导回任何宿主时写侧按目标原生形态还原，正文一字不丢。
-              const compact = role === 'user' && compactionInjectionKind(text) !== null;
+              const compact = role === 'user' && (compactRow || compactionInjectionKind(text) !== null);
               const body = compact ? compactionSummaryText(text) : text;
               if (body.trim()) items.push(messageItem(role, body, ts, compact));
             }

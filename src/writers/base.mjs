@@ -392,9 +392,9 @@ export function readJsonlFile(file) {
 // 唯一的实现只有 util 那一份 —— provenance 的 sidecar 与备份快照也要用它，不能各写一套。
 export { writeFileAtomic };
 
-export function writeJsonlFile(file, objs) {
+export function writeJsonlFile(file, objs, opts) {
   const body = objs.map((o) => JSON.stringify(o)).join('\n');
-  return writeFileAtomic(file, objs.length ? `${body}\n` : '');
+  return writeFileAtomic(file, objs.length ? `${body}\n` : '', opts);
 }
 
 /**

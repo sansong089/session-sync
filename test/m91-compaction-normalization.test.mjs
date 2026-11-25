@@ -14,12 +14,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { makeCtx } from '../src/hosts.mjs';
-import { seedHostSeen } from './matrix-home.mjs';
+import { seedHostSeen, setupHome } from './matrix-home.mjs';
 import { getWriter } from '../src/writers/index.mjs';
 import { opencodeWriter } from '../src/writers/opencode.mjs';
-import { readSession } from '../src/readers/index.mjs';
-import { makeSession, makeTurn, messageItem, sessionCoreFingerprints } from '../src/ir.mjs';
+import { listSessions, readSession } from '../src/readers/index.mjs';
+import { attachmentItem, makeSession, makeTurn, messageItem, sessionCoreFingerprints } from '../src/ir.mjs';
 import { compactionInjectionKind } from '../src/text.mjs';
+import { planImport, executePlan } from '../src/import.mjs';
+import { mintTargetId } from '../src/identity.mjs';
+import { verifyImported } from '../src/verify.mjs';
 
 process.env.SESSION_SYNC_LOCK_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-m91-locks-'));
 
@@ -156,5 +159,226 @@ test('opencode：原生边界往返压缩正文逐字不变，核心指纹收敛
   assert.equal(ocCompact.length, 1);
   assert.equal(ocCompact[0].text, BARE, 'opencode 往返正文逐字不变');
   assert.deepEqual(sessionCoreFingerprints(ocBack), sessionCoreFingerprints(src), '核心指纹收敛');
+});
+
+test('WorkBuddy cleans native summary text consistently with or without the summary wrapper', (t) => {
+  const { home, ctx } = setupHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const src = sourceWithCompact();
+  const targetId = mintTargetId('workbuddy-cn', 'workbuddy-injected-summary', TS);
+  const out = getWriter('workbuddy-cn').write(ctx, { session: src, targetId, mode: 'create' });
+  assert.equal(out.ok, true, JSON.stringify(out));
+  const rows = fs.readFileSync(out.path, 'utf8').trim().split('\n').map(JSON.parse);
+  const boundary = rows.find((row) => row.id?.startsWith('cmp_'));
+  boundary.content[0].text = '<cb_summary>' + BARE.replace('\n\n', '\n<system-reminder>Injected context</system-reminder>\n\n\n') + '</cb_summary>';
+  fs.writeFileSync(out.path, rows.map(JSON.stringify).join('\n') + '\n');
+  const tagged = readSession('workbuddy-cn', ctx, targetId).session;
+  assert.equal(tagged.turns[1].items[0].text, BARE);
+  assert.deepEqual(sessionCoreFingerprints(tagged), sessionCoreFingerprints(src));
+  boundary.content[0].text = boundary.content[0].text.replace('<cb_summary>', '').replace('</cb_summary>', '');
+  fs.writeFileSync(out.path, rows.map(JSON.stringify).join('\n') + '\n');
+  const bare = readSession('workbuddy-cn', ctx, targetId).session;
+  assert.equal(bare.turns[1].items[0].compact, true);
+  assert.equal(bare.turns[1].items[0].text, BARE);
+});
+
+test('OpenCode v2 carries marked summary fragments in one user row with ordinary text and an attachment', (t) => {
+  const { home, ctx } = setupHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const src = sourceWithCompact();
+  const items = src.turns[1].items;
+  const continuation = 'Please continue with the conversation based on the summarized context above. Maintain the same level of detail and helpfulness as before the summarization.';
+  items.splice(1, 0, messageItem('user', 'Keep this question', TS), messageItem('user', continuation, TS, true), attachmentItem('D:/work/demo/test.txt', 'user file', TS));
+  const targetId = mintTargetId('opencode', 'opencode-mixed-summary', TS);
+  const result = getWriter('opencode').write(ctx, { session: src, targetId, mode: 'create' });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const back = readSession('opencode', ctx, targetId).session;
+  assert.deepEqual(sessionCoreFingerprints(back), sessionCoreFingerprints(src));
+  assert.equal(verifyImported({ readSession: () => back, variant: 'opencode', sessionId: targetId, expectSource: src }).ok, true);
+  assert.deepEqual(back.turns[1].items.filter((item) => item.role === 'user').map((item) => [item.text, Boolean(item.compact)]),
+    [[BARE, true], ['Keep this question', false], [continuation, true]]);
+  assert.equal(back.turns[1].items.some((item) => item.kind === 'attachment'), true);
+});
+
+test('multi-source import inherits compact marks from a covered same-origin prefix', (t) => {
+  const { home, ctx } = setupHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const seed = sourceWithCompact();
+  const id = mintTargetId('workbuddy-cn', 'source-compaction-donor', TS);
+  const prefix = { ...seed, id, variant: 'workbuddy-cn', turns: seed.turns.slice(0, 2) };
+  assert.equal(getWriter('workbuddy-cn').write(ctx, { session: prefix, targetId: id, mode: 'create' }).ok, true);
+  const first = planImport(ctx, { from: ['workbuddy-cn'], into: ['codex'], ids: [id] });
+  const codex = executePlan(ctx, first, { apply: true })[0];
+  assert.equal(codex.verify?.ok, true);
+  const persisted = fs.readFileSync(codex.path, 'utf8').trim().split('\n').map(JSON.parse);
+  const oldRows = persisted.filter((row) => row.type !== 'compacted');
+  for (const row of oldRows) {
+    if (row.type !== 'response_item' || row.payload.role !== 'user') continue;
+    for (const block of row.payload.content) block.text = block.text.replace('<cb_summary>', '').replace('</cb_summary>', '');
+  }
+  fs.writeFileSync(codex.path, oldRows.map(JSON.stringify).join('\n') + '\n');
+  const longer = { ...seed, id: codex.targetId, variant: 'codex' };
+  assert.equal(getWriter('codex').write(ctx, { session: longer, targetId: codex.targetId, mode: 'append', fromTurnIndex: 2 }).ok, true);
+  const plan = planImport(ctx, { from: ['codex', 'workbuddy-cn'], into: ['opencode'], ids: [id] });
+  assert.equal(plan.sourceDuplicates.length, 1);
+  assert.equal(plan.pairs[0].sourceVariant, 'codex');
+  const result = executePlan(ctx, plan, { apply: true })[0];
+  assert.equal(result.verify?.ok, true, JSON.stringify(result));
+  const back = readSession('opencode', ctx, result.targetId).session;
+  assert.equal(back.turns[1].items[0].compact, true);
+  assert.deepEqual(sessionCoreFingerprints(back), sessionCoreFingerprints(seed));
+});
+
+test('Codex create/append -> WorkBuddy native append preserves compact blocks and turn fingerprints', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-m91-codex-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const ctx = seedHostSeen(makeCtx({ home, platform: 'win32', appData: path.join(home, 'AppData', 'Roaming'), env: {} }), ['codex', 'workbuddy-cn']);
+  const src = sourceWithCompact();
+  src.turns[2].items.unshift(messageItem('user', 'Mixed compact summary', TS + 4, true));
+  const prefix = { ...src, turns: src.turns.slice(0, 2) };
+  const codexId = 'cd83b24a-2f52-49a8-a07e-60ee7a82d815';
+  const wbId = '0bb63fec-ed68-4799-863c-2a2189684cb8';
+  const codex = getWriter('codex');
+  const wb = getWriter('workbuddy-cn');
+  const write = (writer, session, targetId, mode, fromTurnIndex) => {
+    const out = writer.write(ctx, { session, targetId, mode, fromTurnIndex, provenance: null });
+    assert.equal(out.ok, true, JSON.stringify(out));
+    return out;
+  };
+  const rollout = write(codex, prefix, codexId, 'create').path;
+  write(codex, src, codexId, 'append', 2);
+  const back = readSession('codex', ctx, codexId).session;
+  const compactTexts = (s) => s.turns.map((turn) => turn.items.filter((i) => i.compact).map((i) => i.text));
+  assert.deepEqual(compactTexts(back), [[], [BARE], ['Mixed compact summary']]);
+  assert.deepEqual(sessionCoreFingerprints(back), sessionCoreFingerprints(src));
+  const boundaries = fs.readFileSync(rollout, 'utf8').trim().split('\n').map(JSON.parse).filter((row) => row.type === 'compacted');
+  assert.equal(boundaries.length, 1);
+  assert.equal(boundaries[0].payload.replacement_history[0].content[0].text, BARE);
+  write(wb, prefix, wbId, 'create');
+  const out = write(wb, back, wbId, 'append', 2);
+  const jsonl = fs.readFileSync(out.path, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(jsonl.filter((row) => row.id?.startsWith('cmp_')).length, 1, 'mixed user row is not a whole-message boundary');
+  const boundaryIndex = jsonl.findIndex((row) => row.id?.startsWith('cmp_'));
+  assert.equal(jsonl[boundaryIndex].parentId, undefined);
+  assert.equal(jsonl[boundaryIndex].logicalParentId, jsonl[boundaryIndex - 1].id);
+  assert.equal(jsonl[boundaryIndex + 1].parentId, jsonl[boundaryIndex].id);
+  const returned = readSession('workbuddy-cn', ctx, wbId).session;
+  assert.deepEqual(compactTexts(returned), compactTexts(src));
+  assert.deepEqual(sessionCoreFingerprints(returned), sessionCoreFingerprints(src));
+});
+
+for (const native of [false, true]) test('portable compaction NxN import keeps round-trip append and skip stable (' + (native ? 'native MiniMax' : 'legacy MiniMax') + ')', (t) => {
+  const variants = ['opencode', 'codex', 'workbuddy-cn', 'qoder-cn', 'minimax'];
+  const { home, ctx } = setupHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  if (native) ctx.env.SESSION_SYNC_MINIMAX_NATIVE = '1';
+  const seed = sourceWithCompact();
+  const extended = [...seed.turns, makeTurn('user', [messageItem('user', 'Another portable summary', TS + 6, true)], TS + 6)];
+  const plan = (from, into, id) => planImport(ctx, { from: [from], into, ids: [id] });
+  const apply = (p) => executePlan(ctx, p, { apply: true });
+  const read = (variant, id) => readSession(variant, ctx, id).session;
+  for (const from of variants) {
+    const origin = mintTargetId(from, 'compaction-fixture:' + from, TS);
+    // Seed the origin without the last round, then carry the longer copy back from each target.
+    const prefix = { ...seed, id: origin, variant: from, turns: seed.turns.slice(0, 2) };
+    const initial = getWriter(from).write(ctx, { session: prefix, targetId: origin, mode: 'create' });
+    assert.equal(initial.ok, true, JSON.stringify(initial));
+    const into = variants.filter((v) => v !== from);
+    for (const r of apply(plan(from, into, origin))) {
+      assert.equal(r.action, 'create', JSON.stringify(r));
+      assert.equal(r.verify?.ok, true, JSON.stringify(r.verify));
+      const copy = read(r.target, r.targetId);
+      assert.deepEqual(copy.turns[1].items.filter((i) => i.compact).map((i) => i.text), [BARE], r.target);
+      const longer = { ...copy, turns: extended };
+      const extension = getWriter(r.target).write(ctx, { session: longer, targetId: r.targetId, mode: 'append', fromTurnIndex: 2 });
+      assert.equal(extension.ok, true, JSON.stringify(extension));
+      const target = read(r.target, r.targetId);
+      assert.deepEqual(sessionCoreFingerprints(target), sessionCoreFingerprints(longer), r.target);
+      assert.deepEqual(target.turns[3].items.filter((i) => i.compact).map((i) => i.text), ['Another portable summary'], r.target);
+      const back = plan(r.target, [from], r.targetId);
+      assert.equal(back.pairs[0].targetId, origin);
+      if (read(from, origin).turns.length === 2) {
+        assert.equal(back.pairs[0].action, 'append');
+        assert.equal(apply(back)[0].verify?.ok, true);
+      } else {
+        assert.equal(back.pairs[0].action, 'skip');
+      }
+      assert.equal(plan(r.target, [from], r.targetId).pairs[0].action, 'skip');
+      assert.deepEqual(read(from, origin).turns[3].items.filter((i) => i.compact).map((i) => i.text), ['Another portable summary'], from);
+    }
+  }
+});
+
+test('WorkBuddy -> MiniMax -> Codex re-exports MiniMax summary text as a Codex native boundary', (t) => {
+  const { home, ctx } = setupHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const id = mintTargetId('workbuddy-cn', 'compaction-through-minimax', TS);
+  const source = { ...sourceWithCompact(), id, variant: 'workbuddy-cn' };
+  const original = getWriter('workbuddy-cn').write(ctx, { session: source, targetId: id, mode: 'create' });
+  assert.equal(original.ok, true, JSON.stringify(original));
+
+  const via = executePlan(ctx, planImport(ctx, { from: ['workbuddy-cn'], into: ['minimax'], ids: [id] }), { apply: true })[0];
+  assert.equal(via.verify?.ok, true, JSON.stringify(via));
+  const copied = readSession('minimax', ctx, via.targetId).session;
+  assert.deepEqual(copied.turns[1].items.filter((item) => item.compact).map((item) => item.text), [BARE]);
+
+  const result = executePlan(ctx, planImport(ctx, { from: ['minimax'], into: ['codex'], ids: [via.targetId] }), { apply: true })[0];
+  assert.equal(result.verify?.ok, true, JSON.stringify(result));
+  const restored = readSession('codex', ctx, result.targetId).session;
+  assert.deepEqual(restored.origin, { variant: 'workbuddy-cn', sessionId: id });
+  assert.ok(restored.chain.some((hop) => hop.variant === 'minimax' && hop.sessionId === via.targetId));
+  assert.deepEqual(sessionCoreFingerprints(restored), sessionCoreFingerprints(source));
+  const boundaries = fs.readFileSync(result.path, 'utf8').trim().split('\n').map(JSON.parse).filter((row) => row.type === 'compacted');
+  assert.equal(boundaries.length, 1);
+  assert.equal(boundaries[0].payload.replacement_history[0].content[0].text, BARE);
+});
+
+test('write verification detects compaction loss with identical core fingerprints', () => {
+  const expectSource = sourceWithCompact();
+  const target = structuredClone(expectSource);
+  delete target.turns[1].items[0].compact;
+  assert.deepEqual(sessionCoreFingerprints(target), sessionCoreFingerprints(expectSource));
+  const result = verifyImported({ readSession: () => target, variant: 'codex', sessionId: 'target', expectSource });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.compactionMismatches, [1]);
+});
+
+test('write verification detects extra and shifted compaction marks in identical core text', () => {
+  const source = sourceWithCompact();
+  source.turns[1].items.splice(1, 0, messageItem('user', BARE, TS));
+  const target = structuredClone(source);
+  target.turns[0].items[0].compact = true;
+  delete target.turns[1].items[0].compact;
+  target.turns[1].items[1].compact = true;
+  assert.deepEqual(sessionCoreFingerprints(target), sessionCoreFingerprints(source));
+  assert.deepEqual(verifyImported({ readSession: () => target, variant: 'codex', sessionId: 'target',
+    expectSource: source }).compactionMismatches, [0, 1]);
+});
+
+test('Codex native compaction reads plaintext once and records opaque boundaries without replaying retained history', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-m91-native-codex-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const ctx = seedHostSeen(makeCtx({ home, platform: 'win32', appData: path.join(home, 'AppData', 'Roaming'), env: {} }), ['codex']);
+  const id = '131764c9-c7a4-4a9c-ba8c-efe81239cd59';
+  const dir = path.join(home, '.codex', 'sessions', '2026', '10', '22');
+  fs.mkdirSync(dir, { recursive: true });
+  const timestamp = new Date(TS).toISOString();
+  const rows = [
+    { type: 'session_meta', payload: { id } },
+    { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ text: 'Original question' }] } },
+    { type: 'compacted', payload: { message: BARE, replacement_history: [] } },
+    { type: 'compacted', payload: { message: BARE, replacement_history: [] } },
+    { type: 'compacted', payload: { message: '', replacement_history: [
+      { type: 'message', role: 'user', content: [{ text: 'Retained history' }] },
+      { type: 'compaction', encrypted_content: 'opaque' },
+    ] } },
+  ];
+  const file = path.join(dir, `rollout-2026-10-22T00-00-00-${id}.jsonl`);
+  fs.writeFileSync(file, rows.map((row) => JSON.stringify({ timestamp, ...row })).join('\n'));
+  const session = readSession('codex', ctx, id).session;
+  assert.deepEqual(session.turns.map((turn) => turn.items[0].text), ['Original question', BARE, BARE]);
+  assert.ok(session.turns.slice(1).every((turn) => turn.items[0].compact));
+  assert.deepEqual(session.meta.compactions.map((event) => event.kind), ['plaintext', 'plaintext', 'encrypted']);
+  assert.equal(listSessions('codex', ctx).sessions.find((row) => row.id === id).turns, 3);
 });
 

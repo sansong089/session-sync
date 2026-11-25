@@ -899,7 +899,7 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 
 ## 6. codex — Codex
 
-> **存储模型**：文件 + 注册表 + 线程库三层：rollout JSONL 是正文，全局状态文件是列表前置，线程库存标题与账户。形态见「变体形态矩阵」。
+> **存储模型**：rollout JSONL 保存正文与桌面回放事件，全局状态文件登记侧栏归属，线程库登记可列出的线程及其标题、账户。形态见「变体形态矩阵」。
 
 ### V1 数据根与定位
 
@@ -1028,17 +1028,29 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
-| 存储实体 | 事件类型 `session_meta` / `response_item` / `event_msg` / `turn_context` / `world_state` / `token_usage_record` / `compacted`；**只取 `response_item`**（`event_msg/item_completed` 是同一内容的重复投影，读它会得到双份） | 【真机】 |
+| 存储实体 | 事件类型 `session_meta` / `response_item` / `event_msg` / `turn_context` / `world_state` / `token_usage_record` / `compacted`。普通对话取 `response_item`，避免重复读取 `event_msg` 中的消息投影。 | 【真机】 |
 | 关键列与约束 | `response_item.payload.type`：`message`(role developer\|user\|assistant) / `reasoning` / `custom_tool_call` / `custom_tool_call_output` / `function_call` / `function_call_output`；上下文注入过滤：`# AGENTS.md instructions`、`<turn_aborted>`、`<external_codex_apps_open_page>`、`<environment_context>` 等 role=user 注入块视作非用户输入 | 【真机】 |
 | 标题落点 | 线程库 `threads.title`；`threads.name` 是用户手动改名才有的列 | 【真机】 |
+
+**【真机】原生上下文压缩。** 桌面 0.169.1 的 `compacted` 事件可包含空 `payload.message`，及含 `type='compaction'` / `encrypted_content` 的 `replacement_history`。替代历史同时含保留的用户和开发者上下文。
+
+**【源码】【真机】明文压缩摘要。** `compacted.payload.message` 可保存明文摘要。Codex CLI 0.169.1 对照实测：`replacement_history` 只存摘要时，续写请求从摘要开始，接上后续消息，旧上下文未进入模型请求。桌面续写仍待取证【待证 待证-codex-4】。
+
+**【真机】导入会话头。** 首行 `session_meta.payload` 必须带 `originator`、`cli_version`。
+本机 0.169.1 的 `thread/read` 对缺少这些字段的导入文件返回 `does not start with session metadata`。
+
+**【真机】导入正文回放。** 0.169.1 的 `legacy` 回放用 `event_msg/task_started` 和 `task_complete`
+划分轮次，用 `user_message`、`agent_message` 展示文字。只有 `response_item` 时读取结果为 0 轮。
+只补轮次边界和 `item_completed` 时有轮次、没有文字。补齐 legacy 事件后，86 轮样本返回
+86 条用户消息和 476 条助手消息。
 
 ### V7 可见性与索引契约
 
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
-| 列表来源 | 注册表 `.codex-global-state.json` 是可见性的**硬前置**：只写 rollout 文件的会话宿主侧栏不列；需读-改-写并保留未知键；注册表整体按**账户分区**（owner 空间）存放 | 【真机】 |
+| 列表来源 | 侧栏归属由 `.codex-global-state.json` 注册表登记，线程由 `state_<N>.sqlite` 的 `threads` 表索引。宿主迁移器对缺线程行的外部 rollout 报 `missing_sqlite_metadata`。注册表需读-改-写并保留未知键。 | 【真机】 |
 | 打开正文依赖 | 非项目：`projectless-thread-ids`（**顶层**）含该 id、`thread-workspace-root-hints[id]` = 桶根字符串、`thread-projectless-output-directories[id]` = `<会话目录>/outputs`（后两者在 **owner 分区键** `electron-owner-value:<key>:<ownerId>` 下，顶层裸键宿主**读不到**），**不**挂 `thread-project-assignments`；项目：`thread-project-assignments[id]` = `{projectKind:"local", projectId}`、`local-projects[projectId]` = `{id, name, rootPaths:[repo根], createdAt, updatedAt}`、projectId 进 `project-order`（这两项**仍在顶层**） | 【真机】键结构 ／【源码】宿主 storageKey→a6 只解析 owner 空间键 |
-| 标题裁决 | 线程库 `threads.title` | 【真机】 |
+| 标题裁决 | 线程库优先使用 `threads.name`，其次使用 `threads.title`。`name` 保存宿主手动改名。 | 【真机】 |
 | 缺字段后果 | 宿主列表是否按 `creator_user_id` 过滤（决定切账号后旧会话是否可见） | 【待证 待证-codex-1】 |
 
 ### V8 项目与工作区归属
@@ -2031,7 +2043,7 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | --- | --- | --- |
 | 会话边界 | 一会话 = `local_runtime_sessions` 一行 + `messages.jsonl` 文件；`history_relative_dir` 留 NULL 时宿主按 `(session_id, created_at_ms)` 自己派生并绑定 | 【真机】 |
 | 会话 ID 形态 | `history_relative_dir` = `YYYY/MM/DD/HH-mm-ss-mmm-session_<base64url(sessionId)>`（**UTC，4 段斜杠**）；**库里的值就是磁盘相对路径**（`<v2/sessions>/<该值>`），可直接拼。宿主的校验：必须是 4 段、不含反斜杠、非绝对路径 | 【源码】【真机】 |
-| 命名与目录派生 | 正文源选择链：`messages.jsonl → authoritativeLedgerSnapshot → local_runtime_message_rows → sqliteBlob`；宿主物化器（`canonical-history-materializer`）在会话**没有 legacy 账本**时只发布**空文件**，不会从 DB 行回填 ⇒ 外部导入必须自己落规范文件，否则空文件会遮住导入正文 | 【源码】【真机】 |
+| 命名与目录派生 | 正文源选择链：`messages.jsonl → authoritativeLedgerSnapshot → local_runtime_message_rows → sqliteBlob`。未接入旧历史读写接口的物化器会在文件缺失时发布空历史。接入旧历史接口时，见 V5 的规范历史物化登记 | 【源码】【真机】 |
 | 非项目桶 | `~/.minimax/sessions/<id>/workspace`（`generated` 形态） | 【真机】 |
 
 ### V5 存储格式与编码
@@ -2052,6 +2064,32 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | `toolResult` | `{toolCallId, toolName, content:[{type:'text',text}], details, isError, timestamp}` | **工具回执独立成行**，不写在 `assistant` 行的块里 | 【真机】 |
 | `custom` | `{customType, content, display}`：`session_identity_reminder` / `todo_cadence_reminder` / `background_task_read_settlement` | 宿主内部注入；`display:false` = 宿主自己也不显示 | 【真机】 |
 | `compactionSummary` | `{summary}`（无 `content` 块），`turn_id` 带 `:compaction` 后缀 | 上下文压缩摘要 | 【真机】 |
+
+**【源码】压缩边界位置。** 宿主的 `history-sequence-validator.js` 要求原生压缩边界是所校验历史序列的首条，而且只允许一条。`segment-prefix.js` 从分段记录的第一条提取压缩头。`canonical-history-jsonl.js` 接受只含 `role` 和 `summary` 的摘要，或同时带 `tokensBefore` 和 `timestamp` 的变体。
+
+**【真机】压缩代际文件。** MiniMax Code 3.1.17.228 的一份活动代 1 样本中，活动 `messages.jsonl` 的首条为唯一的 `compactionSummary`，首条 envelope 带 `history_artifact`。前一代正文位于 `snapshots/g000000000000--<compactionId>.jsonl`。目录内还可见 `history-catalog.json`（`schemaVersion`、`sessionId`、`activeGeneration`、`activeRevision`、`artifacts`，artifact 含类别、文件名、代号、revision、字节数和记录数）与 `user-message-locators.jsonl`（消息 ID 对应代号、行号、字节偏移及 artifact revision）。
+
+**【源码】压缩提交与血缘。** 安装包 `app.asar` 中 `@mavis/local-runtime-v2` 的 `canonical-history-provider.js` 先发布上一代快照，再替换活动历史，最后回读校验。新段首条的 `history_artifact` 含 `schemaVersion:1`、`generation`、`producedBy` 与 `parentSnapshot:{generation,compactionId,revision}`。`canonical-history-scanner.js` 从活动首条顺着父指针核对快照文件名与语义 revision，另外检查相邻代保留的外部用户记录身份及内容。`segment-replacement.js` 按递增的源位置原样保留记录，保留记录可以横跨压缩覆盖区和未覆盖区。`session-history-mutation-adapter.js` 的回退和分叉使用指定的新活动 revision 和可达快照。目录里其余快照可能属于其他分支或未完成的操作。语义 revision 基于宿主解码后的记录序列及稳定 JSON 排序，见 `canonical-history-jsonl.js` 和 `canonical-history-revision.js`。
+
+**【源码】消息身份约束。** 扫描器要求 `msg-user-v1-` 前缀的消息仍是外部用户消息。构造段首摘要时使用独立的非用户消息 ID。用安装包扫描器复核了隔离生成的两代历史和宿主自身产生的一代历史。
+
+**【源码】摘要附录。** `compaction/compat.js` 从 `compactionSummary.summary` 的尾部解析合法的 `mavis-context-appendix`，并单独返回最近提问、Todo、提醒或子任务等运行状态。无合法附录时，宿主保留原摘要全文。校验器还识别带 `archonCompaction` 的旧式 user 边界，具体按旧版本结构解析。
+
+**【真机】【源码】规范历史物化登记。** MiniMax Code 3.1.18.230 的 `canonical-history-materializer.js` 按会话 ID 查询 `local_runtime_pi_history_file_migrations`。缺少登记时，宿主比较活动文件和从旧账本、SQLite 行或 blob 选出的正文。revision 不一致时，AgentHost 在 `history_read` 报 `Canonical history materialization is ambiguous`。已有登记时，物化器检查活动文件存在，随后进入正常历史读取。宿主 SideChat 用 `source='empty'` 登记预发布的非空历史。表含 `session_id`（主键）、`migrated_at_ms`、`source`、`message_count`、`target_revision`，后四列均非空。记录数只计活动文件，revision 由 `canonicalActiveHistoryRevision` 计算。登记保存首次物化信息，后续历史变更沿用已有行。
+
+**【待证 待证-minimax-3】外部原生提交。** 已发现宿主内部 typed compaction 提交路径。对外可调用性、进程完全退出后的续写，以及 catalog 与 locator 的生成时机仍待验证。
+
+**【真机】外部原生历史续写。** MiniMax Code 3.1.18.230 的导入探针补齐物化登记后，桌面「继续」通过 AgentHost 的 `history_read` 并写入新的助手回复。宿主保留原活动记录及 revision 前缀，新回复含活动段用户尾部的合成标记。该操作可只追加助手记录，由统一组轮规则接在上一轮末尾。
+
+**【真机】【源码】助手消息请求回放。** 3.1.18.230 的规范 JSONL 解码器接受缺少 `provider` 的助手记录，出站转换器 `outbound-message-normalizer.js` 的跨模型回放调用 `message.provider.startsWith(...)`。新输入可能在工具上下文计数时触发异常。用同一份真机记录调用出站转换器，补入表示外部导入的字符串后可通过转换。
+
+**【真机】原生摘要送模与回复落盘。** 3.1.18.230 在默认数据根重试已修复的导入探针 `7dd8b19cdedc`。日志记录 `execution_mode=continuation`、`history_read` 完成及 `beforeLlmCall` 构建请求。助手回复追加到活动代 1，准确返回摘要和活动尾部的标记，已覆盖前史标记返回 `UNKNOWN`。以同一活动历史调用安装包的出站转换器，确认生成的请求包含摘要及尾部标记，排除已覆盖前史标记。完整历史回读仍能取得父代和原始来源。
+
+**【真机】导入历史的新输入与再次压缩。** 3.1.18.230 在同一默认数据根对该探针发起 `execution_mode=activate` 的新一轮，完成 `history_read` 并落盘助手回复。桌面手动压缩的 `request-compaction` 返回 200。活动代由 1 变为 2，活动文件仅含宿主新摘要，父代 1 和父代 0 的 JSONL 快照均可达，revision 对照通过。该样本在新输入和压缩后未生成 `history-catalog.json` 和 `user-message-locators.jsonl`，可通过活动文件的父指针回读两代。新输入仍使用先前的运行实例，完整退出再启动另行验收。
+
+**【真机】默认根第 2 代只读复核。** 使用 3.1.18.230 安装包的原生扫描器确认活动 revision、两代父快照和摘要正文。同步 reader 恢复 11 条记录，探针导入段的核心指纹与来源一致。脚本同时用安装包的历史引擎在临时会话中复核保留记录、分支和回退。
+
+**【待证 待证-minimax-4】多代保留与回退。** 现有活动代 1 样本未观察到活动文件与父快照共享消息 ID。须在带保留记录的多代压缩、回退和分叉样本中核对记录身份、回退后的可达链及投影更新。
 
 块类型全量只有三种：`text` / `thinking` / `toolCall`。
 `tool_use` / `tool_result` 是**本工具自己的 π 块词汇**（只存在于 `data_json['session-sync-content']` 与 IR），
@@ -2173,7 +2211,7 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | 规格项 | 内容 | 证据 |
 | --- | --- | --- |
 | 列表来源 | 桌面侧栏读 `local_runtime_sessions`，判定走 `projects/sidebar/predicate.js` 的 `eligible()`：六个硬门（`columnar_version=3`、`agent_name IN ('mavis','main')`、`archived=0`、`visibility<>'hidden'`、`session_kind NOT IN ('peek','cron')`、`parent_session_id IS NULL`）**之外**还要过三道侧栏专属条件 —— ① 所在项目未隐藏且未被「移除项目」；② 不在**内部主会话**排除名单里；③ 会话类型落在「branch 普通对话 / branch channel / root 普通会话」三者之一。**内部主会话排除**：`listInternalDefaultRootIds` 把「`session_type='root'` 且 `session_kind='conversation'`」且（不是 legacy IM 标记、`extra_data_json` 里没有 `runLocation`）且（`is_default_workspace=1` 或落在 Agent 内部默认工作目录）的行判为 Agent 自己的 Main 会话，从侧栏整体排除 ⇒ **普通会话写成 `'root'` 时在桌面侧栏整条不可见**（库里有、运行时列表查得到、侧栏没有；六个硬门全过也没用）。导入侧必须写 `'branch'`，并在索引自愈通道里把老版本写出的 `'root'` 改回来（只改带本工具来源标记的行，宿主原生行不动） | 【源码】【真机】 |
-| 打开正文依赖 | 见 V3 正文源选择链（文件 → 账本快照 → DB 行 → blob 四级回退）；会话首次被宿主打开后，宿主会自己把 DB 行物化成 `messages.jsonl` 并绑定 `history_relative_dir`。**外部导入必须自己先写这份规范文件**（`messages.jsonl` + `manifest.json` + 行的 `history_relative_dir`）：宿主物化器在会话没有 legacy 账本时只会发布**空文件**，空文件一旦存在就是模型上下文的唯一来源 ⇒ 导入正文在模型上下文里消失（界面消息列表仍看得到，因为它读 DB 行）。文件已存在时物化器不覆盖，宿主后续回合直接追加在后面。**文件与 DB 行会分叉**：物化出的空文件里没有 DB 行的正文（宿主不回填），此后宿主只往文件里追加 —— 于是「文件里有几轮」与「DB 行里有几轮」可以是两个数 | 【源码】【真机】 |
+| 打开正文依赖 | 界面可从文件、账本或 DB 显示投影打开历史。AgentHost 续写读取规范历史，外部预发布须提供 `messages.jsonl`、`manifest.json`、`history_relative_dir` 及当前版的 V5 物化登记。文件与 DB 行可有不同的轮数，尤其是原生压缩后，活动文件只含当前段 | 【源码】【真机】 |
 | 标题裁决 | `local_runtime_sessions.title`；侧栏的**标题搜索**另走 FTS5 虚表 `local_runtime_sessions_fts`，这份搜索文档**由宿主在会话首次被打开/物化时自己写**（外部预写会占掉宿主下一次分配的 FTS rowid —— 那张 rowid 登记表是自增的，必须与宿主同步），代价是会话被打开前搜不到 | 【源码】【真机】 |
 | 缺字段后果 | 外部构造会话的 oracle 已取证（见「列表来源」与「标题裁决」两行）：桌面侧栏能列出并打开，正文按 V3 的回退链读出。宿主首次物化会话时用自己的一套默认值重写 `extra_data_json`，**DB 行里的来源标记槽被抹掉** ⇒ 只靠那一列认不出「这条会话是导入来的」，来源标记必须另有一份落在宿主不碰的文件上 | 【真机】 |
 
@@ -2184,7 +2222,7 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | 项目判定 | 侧栏分组靠 `project_id` 列，不靠目录 | 【真机】 |
 | 会话归属键 | `local_runtime_sessions.project_id`（宿主在 `columnar_version=3` 会话插入时自动回填）。回填用的是**等值比较** `p.workspace_dir = NEW.project_workspace_dir` —— 字节级相等才算命中同一个项目 | 【源码】【真机】 |
 | 项目注册表 | `local_runtime_projects` 表（宿主自动建行）。**项目键是字节级目录串**：`workspace_dir` 上有部分唯一索引（`project_kind='workspace'` 时生效），所以同一个目录的两种写法（Windows 上 `d:\work` 与 `D:\work` 是同一个目录）会被当成两个项目行 → 侧栏两个同名分组 | 【源码】【真机】 |
-| 非项目会话 | 判据：`is_default_workspace=1` / `project_kind='default'`；桶 `~/.minimax/sessions/<id>/workspace`（`generated` 形态，键是 ID 不含日期） | 【真机】 |
+| 非项目会话 | 判据：`is_default_workspace=1` / `project_kind='default'`。会话的 `workspace_dir`、`project_workspace_dir` 与 `record_json.workspaceDir` 指向数据根下的 `sessions/<id>/workspace`。项目表的 default 行使用空项目目录（SQL NULL）。`captureAgentHostSession` 要求会话的 `workspaceDir` 为非空字符串，空值报 `workspace-dir`，即使侧栏能打开会话也无法续写 | 【源码】【真机】 |
 | 项目显示名 | 本地项目组 localStorage 键 `mavis:sidebar:projectGroupPrefs:v1` 的 `aliases`（键 = 规范化 workspaceDir）；远端项目 `mavis.remote-control.project-aliases.v1:<account>` | 【真机】 |
 
 ### V9 元数据与特殊会话
@@ -3250,11 +3288,14 @@ reasoning，这里只补回宿主 canonical 格式，`format` 未知取 `'unknow
 | 待证-cursor-1 | cursor | 新代 `chats/<...>/store.db` 的表结构 | 取一份新代会话库样本，只读 dump schema 后逐列登记 |
 | 待证-pi-1 | pi | 未知事件行的容忍性 | 向真实会话追加一行未知 type，宿主重新加载验证 |
 | 待证-codex-2 | codex | rollout 对未知事件行的容忍性 | 向真实 rollout 追加一行未知 type，宿主侧栏/打开验证 |
+| 待证-codex-4 | codex | 外部明文摘要在桌面宿主中作为原生压缩边界参与续写（CLI 已证） | 用桌面续写隔离样本，验证模型实际接收的历史 |
 | 待证-workbuddy-1 | workbuddy | 未知事件行的容忍性 | 向真实 jsonl 追加一行未知 type，宿主重新加载验证 |
 | 待证-qoder-1 | qoder | 未知事件行的容忍性 | 向真实 CLI jsonl 追加一行未知 type，宿主重新加载验证 |
 | 待证-zcode-2 | zcode | 未知行的容忍性 | 向正文库 / 列表库各插入未知行，宿主重新加载验证 |
 | 待证-mimo-1 | mimo | 未知部件行的容忍性 | 向 part 表插入未知 type 行，宿主重新加载验证 |
 | 待证-minimax-2 | minimax | 未知行 / 未知 session_kind 的容忍性 | 插入偏离硬门的行，宿主重新加载验证 |
+| 待证-minimax-3 | minimax | 外部提交入口、完整退出后的续写、目录投影的生成时机 | 用新运行实例打开默认数据根的第 2 代探针，核对请求、可达链和投影 |
+| 待证-minimax-4 | minimax | 含保留记录的相邻代身份与回退、分叉后的可达链 | 生成至少两次压缩，分别执行回退、分叉，核对活动首条、父 revision、保留 ID 及投影 |
 | 待证-dsh-2 | dsh | 未知事件行的容忍性 | 向会话文件追加一帧未知 type，宿主重新加载验证 |
 | 待证-kilo-3 | kilo | 宿主对外部构造行的容忍性 | 库 / 任务目录两路分别外部构造，宿主加载验证 |
 | 待证-roo-2 | roo | taskHistory 索引的容忍性 | 向 state.vscdb 单行插入外部条目，宿主侧栏验证 |
@@ -3278,6 +3319,8 @@ oracle 级 = 宿主自己的 CLI / GUI 能加载外部构造的内容。**新取
 | --- | --- | --- |
 | `test/real-host/import-mirror.mjs` | pi、dsh、codex、workbuddy-intl、opencode（`--with-opencode`） | 镜像验收 + verify + 真实树零改动 |
 | `test/real-host/opencode.mjs` | opencode | 镜像验收 + 宿主 CLI oracle |
+| `test/probe-minimax-history.mjs` | minimax | 安装包原生扫描器校验代际和 revision，可选只读真机目录。兼容历史与压缩模块迁入 `@mavis/harness` 的安装包。 |
+| `test/probe-minimax-live.mjs` | minimax | 在当前账号默认根新建单条合成原生压缩会话，按探针编号回读来源、代际、标记和导入指纹 |
 | `test/real-host/mimo.mjs` | mimo | 镜像验收 + 宿主 CLI oracle |
 | `test/real-host/codebuddy.mjs` | codebuddy | 镜像验收 + 宿主 CLI oracle（覆盖 append 与 relocate） |
 | `test/real-host/codebuddy-ide.mjs` | codebuddy-ide | 跨账号切换镜像验收（GUI 协同验收记录见 §21 V6） |
